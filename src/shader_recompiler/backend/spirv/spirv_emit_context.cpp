@@ -952,7 +952,16 @@ spv::ImageFormat GetFormat(const AmdGpu::Image& image) {
 
 Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const auto image = desc.GetSharp(ctx.info);
-    const auto format = desc.is_atomic ? GetFormat(image) : spv::ImageFormat::Unknown;
+    spv::ImageFormat format = spv::ImageFormat::Unknown;
+    if (desc.is_atomic) {
+        format = GetFormat(image);
+        // When native fp32 image atomic min/max is unsupported the float atomics are
+        // emulated as u32 bit-level atomics, so the image must be declared with an
+        // unsigned integer format to match the u32 texel pointer type.
+        if (format == spv::ImageFormat::R32f && !ctx.profile.supports_image_fp32_atomic_min_max) {
+            format = spv::ImageFormat::R32ui;
+        }
+    }
     const auto type = image.GetViewType(desc.is_array);
     const u32 sampled = desc.is_written ? 2 : 1;
     switch (type) {
@@ -978,10 +987,17 @@ void EmitContext::DefineImagesAndSamplers() {
     for (const auto& image_desc : info.images) {
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
-        const bool is_integer = AmdGpu::IsInteger(nfmt);
+        // Float image atomics fall back to u32 bit-level atomics when native support is
+        // unavailable; the image must then be declared as unsigned integer so all texel
+        // accesses match its sampled type.
+        const bool atomic_u32_fallback = image_desc.is_atomic &&
+                                         nfmt == AmdGpu::NumberFormat::Float &&
+                                         !profile.supports_image_fp32_atomic_min_max;
+        const bool is_integer = atomic_u32_fallback || AmdGpu::IsInteger(nfmt);
         const bool is_storage = image_desc.is_written;
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const VectorIds& data_types = GetAttributeType(*this, nfmt);
+        const VectorIds& data_types =
+            GetAttributeType(*this, atomic_u32_fallback ? AmdGpu::NumberFormat::Uint : nfmt);
         const Id sampled_type = data_types[1];
         const Id image_type{ImageType(*this, image_desc, sampled_type)};
 
