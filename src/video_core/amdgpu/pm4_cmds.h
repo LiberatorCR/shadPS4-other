@@ -951,6 +951,10 @@ struct PM4CmdReleaseMem {
 
     void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
         switch (data_sel.Value()) {
+        case DataSelect::None: {
+            // No data is written; the fence only signals.
+            break;
+        }
         case DataSelect::Data32Low: {
             *Address<u32*>() = DataDWord();
             break;
