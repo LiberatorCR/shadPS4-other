@@ -416,7 +416,7 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 uint GetMipLevel(inout uint texel) {
     uint mip = 0;
     uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    while (texel >= mip_size && mip + 1 < info.num_mips) {
         texel -= mip_size;
         ++mip;
         mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
@@ -426,7 +426,13 @@ uint GetMipLevel(inout uint texel) {
 
 void main() {
     uint texel = gl_GlobalInvocationID.x;
+    if (texel >= linear_data.length()) {
+        return;
+    }
     uint mip = GetMipLevel(texel);
+    if (mip >= info.num_mips || texel >= info.mips[mip].size / BYTES_PER_PIXEL) {
+        return;
+    }
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
     uint tiled_offset = info.mips[mip].offset;
@@ -440,9 +446,13 @@ void main() {
     tiled_offset += ComputeSurfaceAddrFromCoordMicroTiled(x, y, slice, pitch, height, 0);
 #endif
 
+    uint tiled_index = tiled_offset / BYTES_PER_PIXEL;
+    if (tiled_index >= tiled_data.length()) {
+        return;
+    }
     if (IS_TILER != 0) {
-        tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+        tiled_data[tiled_index] = linear_data[gl_GlobalInvocationID.x];
     } else {
-        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+        linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_index];
     }
 }

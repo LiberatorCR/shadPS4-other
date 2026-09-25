@@ -4,8 +4,47 @@
 #include "core/libraries/kernel/threads.h"
 #include "core/libraries/libc_internal/libc_internal_threads.h"
 #include "core/libraries/libs.h"
+#include <atomic>
+#include <condition_variable>
 
 namespace Libraries::LibcInternal {
+
+static std::mutex guard_mutex;
+static std::condition_variable guard_condition;
+
+// The first byte is the Itanium C++ guard's initialized flag. The second byte is
+// private in-progress state, protected by guard_mutex.
+s32 PS4_SYSV_ABI cxa_guard_acquire(u64* guard) {
+    auto* bytes = reinterpret_cast<u8*>(guard);
+    std::unique_lock lock{guard_mutex};
+    guard_condition.wait(lock, [&] {
+        return std::atomic_ref<u8>(bytes[0]).load(std::memory_order_acquire) != 0 || bytes[1] == 0;
+    });
+    if (std::atomic_ref<u8>(bytes[0]).load(std::memory_order_acquire) != 0) {
+        return 0;
+    }
+    bytes[1] = 1;
+    return 1;
+}
+
+void PS4_SYSV_ABI cxa_guard_release(u64* guard) {
+    auto* bytes = reinterpret_cast<u8*>(guard);
+    {
+        std::lock_guard lock{guard_mutex};
+        std::atomic_ref<u8>(bytes[0]).store(1, std::memory_order_release);
+        bytes[1] = 0;
+    }
+    guard_condition.notify_all();
+}
+
+void PS4_SYSV_ABI cxa_guard_abort(u64* guard) {
+    auto* bytes = reinterpret_cast<u8*>(guard);
+    {
+        std::lock_guard lock{guard_mutex};
+        bytes[1] = 0;
+    }
+    guard_condition.notify_all();
+}
 
 void getMutexName(char* buf, u64 size, const char* name) {
     if (name != nullptr) {
@@ -56,6 +95,12 @@ s32 PS4_SYSV_ABI internal__Mtxdst(Libraries::Kernel::PthreadMutexT* mtx) {
 }
 
 void RegisterlibSceLibcInternalThreads(Core::Loader::SymbolsResolver* sym) {
+    LIB_FUNCTION("3GPpjQdAMTw", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 cxa_guard_acquire);
+    LIB_FUNCTION("9rAeANT2tyE", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 cxa_guard_release);
+    LIB_FUNCTION("2emaaluWzUw", "libSceLibcInternal", 1, "libSceLibcInternal",
+                 cxa_guard_abort);
     LIB_FUNCTION("z7STeF6abuU", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxinit);
     LIB_FUNCTION("pE4Ot3CffW0", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxlock);
     LIB_FUNCTION("cMwgSSmpE5o", "libSceLibcInternal", 1, "libSceLibcInternal", internal__Mtxunlock);

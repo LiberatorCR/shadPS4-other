@@ -214,10 +214,12 @@ void CollectShaderInfoPass(IR::Program& program, const Profile& profile) {
         }
     }
 
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    if (!EmulatorSettings.IsDirectMemoryAccessEnabled() && !info.has_dynamic_buffer) {
         info.uses_dma = false;
         info.readconst_types = Info::ReadConstType::None;
     }
+
+    info.uses_dma |= info.has_dynamic_buffer;
 
     if (info.uses_dma) {
         info.buffers.push_back({

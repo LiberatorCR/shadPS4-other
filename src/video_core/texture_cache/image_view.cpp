@@ -51,6 +51,9 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     : is_storage{desc.is_written} {
     const auto dfmt = image.GetDataFmt();
     auto nfmt = image.GetNumberFmt();
+    if (desc.is_atomic_u32) {
+        nfmt = AmdGpu::NumberFormat::Uint;
+    }
     if (is_storage && nfmt == AmdGpu::NumberFormat::Srgb) {
         nfmt = AmdGpu::NumberFormat::Unorm;
     }

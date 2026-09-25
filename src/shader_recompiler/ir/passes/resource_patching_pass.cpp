@@ -121,6 +121,7 @@ public:
         })};
         auto& image = image_resources[index];
         image.is_atomic |= desc.is_atomic;
+        image.is_atomic_u32 |= desc.is_atomic_u32;
         image.is_written |= desc.is_written;
         return index;
     }
@@ -167,6 +168,9 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     SharpLocation location{};
     if (inst->GetOpcode() == IR::Opcode::GetUserData) {
         return static_cast<SharpLocation>(inst->Arg(0).ScalarReg());
+    } else if (inst->GetOpcode() == IR::Opcode::Phi) {
+        // A merged descriptor has no single CPU-side sharp location.
+        return UNKNOWN_LOCATION;
     } else if (inst->GetOpcode() == IR::Opcode::ReadConstBuffer) {
         location = inst->Flags<IR::BufferInstInfo>().flatbuf_off_dw;
     } else {
@@ -198,8 +202,26 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
                       const Profile& profile) {
     IR::Inst& inst = *resource.user;
 
+    const auto sharp_fetch = ConstructSharpFetch<AmdGpu::Buffer>(resource.sharps[0]);
+    bool has_unknown_location = false;
+    for (u32 i = 0; i < sharp_fetch.N; i++) {
+        has_unknown_location |= (sharp_fetch.load_mask & (1 << i)) &&
+                                sharp_fetch.offsets[i] == UNKNOWN_LOCATION;
+    }
+    if (has_unknown_location && (inst.GetOpcode() == IR::Opcode::StoreBufferU32 ||
+                                 inst.GetOpcode() == IR::Opcode::LoadBufferU32x3) &&
+        resource.sharps[0].post_op == SharpFetchPostOp::None &&
+        inst.Arg(0).Type() == IR::Type::U32x4) {
+        // The descriptor is selected by shader control flow. Preserve its four dwords for
+        // runtime address calculation instead of binding the CPU walker's null descriptor.
+        info.has_dynamic_buffer = true;
+        LOG_INFO(Render_Recompiler, "Using dynamic buffer descriptor in shader {:#x}",
+                 info.pgm_hash);
+        return;
+    }
+
     const u32 buffer_binding = descriptors.Add(BufferResource{
-        .sharp_fetch = ConstructSharpFetch<AmdGpu::Buffer>(resource.sharps[0]),
+        .sharp_fetch = sharp_fetch,
         .used_types = BufferDataType(inst, profile),
         .buffer_type = BufferType::Guest,
         .is_written = IsBufferStore(inst),
@@ -212,6 +234,44 @@ void PatchBufferSharp(const ResourceDiscovery& resource, Info& info, Descriptors
     // Replace handle with binding index in buffer resource list.
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     inst.SetArg(0, ir.Imm32(buffer_binding));
+}
+
+IR::U32 CalculateDynamicBufferAddress(IR::IREmitter& ir, const IR::Inst& inst,
+                                      const IR::Value& handle) {
+    const auto inst_info = inst.Flags<IR::BufferInstInfo>();
+    const IR::U32 dw1{ir.CompositeExtract(handle, 1)};
+    const IR::U32 dw3{ir.CompositeExtract(handle, 3)};
+    const IR::U32 stride{ir.BitwiseAnd(ir.ShiftRightLogical(dw1, ir.Imm32(16)),
+                                       ir.Imm32(0x3fff))};
+
+    IR::U32 index = inst_info.index_enable ? IR::GetBufferIndexArg(&inst) : ir.Imm32(0);
+    const IR::U32 add_tid{ir.BitwiseAnd(ir.ShiftRightLogical(dw3, ir.Imm32(23)), ir.Imm32(1))};
+    index = ir.IAdd(index, IR::U32{ir.Select(ir.IEqual(add_tid, ir.Imm32(0)), ir.Imm32(0),
+                                            ir.LaneId())});
+
+    IR::U32 offset = ir.IAdd(IR::GetBufferSOffsetArg(&inst),
+                             ir.Imm32(static_cast<u32>(inst_info.inst_offset)));
+    if (inst_info.voffset_enable) {
+        offset = ir.IAdd(offset, IR::GetBufferVOffsetArg(&inst));
+    }
+
+    const IR::U32 linear_offset{ir.IAdd(ir.IMul(index, stride), offset)};
+    const IR::U32 index_stride_bits{ir.BitwiseAnd(ir.ShiftRightLogical(dw3, ir.Imm32(21)),
+                                                 ir.Imm32(3))};
+    const IR::U32 element_size_bits{ir.BitwiseAnd(ir.ShiftRightLogical(dw3, ir.Imm32(19)),
+                                                 ir.Imm32(3))};
+    const IR::U32 index_stride{ir.ShiftLeftLogical(ir.Imm32(8), index_stride_bits)};
+    const IR::U32 element_size{ir.ShiftLeftLogical(ir.Imm32(2), element_size_bits)};
+    const IR::U32 swizzled_offset{ir.IAdd(
+        ir.IMul(ir.IAdd(ir.IMul(ir.IDiv(index, index_stride), stride),
+                        ir.IMul(ir.IDiv(offset, element_size), element_size)),
+                index_stride),
+        ir.IAdd(ir.IMul(ir.IMod(index, index_stride), element_size),
+                ir.IMod(offset, element_size)))};
+    const IR::U32 swizzle{ir.BitwiseAnd(ir.ShiftRightLogical(dw1, ir.Imm32(31)), ir.Imm32(1))};
+    const IR::U32 byte_offset{ir.Select(ir.IEqual(swizzle, ir.Imm32(0)), linear_offset,
+                                       swizzled_offset)};
+    return ir.ShiftRightLogical(byte_offset, ir.Imm32(2));
 }
 
 void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
@@ -235,9 +295,22 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         .is_r128 = bool(inst_info.is_r128),
         .post_op = resource.sharps[0].post_op,
     };
+    for (u32 i = 0; i < image_res.sharp_fetch.N; ++i) {
+        if ((image_res.sharp_fetch.load_mask & (1 << i)) &&
+            image_res.sharp_fetch.offsets[i] == UNKNOWN_LOCATION) {
+            LOG_WARNING(Render_Recompiler,
+                        "Runtime-selected image descriptor in shader {:#x}, opcode {}",
+                        info.pgm_hash, inst.GetOpcode());
+            break;
+        }
+    }
 
     auto image = image_res.GetSharp(info);
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
+    image_res.is_atomic_u32 =
+        is_atomic && image.GetDataFmt() == AmdGpu::DataFormat::Format32 &&
+        image.GetNumberFmt() == AmdGpu::NumberFormat::Float &&
+        !profile.supports_image_fp32_atomic_min_max;
 
     if (needs_mip_storage_fallback) {
         // If the mip level to IMAGE_(LOAD/STORE)_MIP is a constant, set up ImageResource
@@ -273,7 +346,18 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
 
     // Patch image instruction if image is FMask.
     if (AmdGpu::IsFmask(image.GetDataFmt())) {
-        ASSERT_MSG(!is_written, "FMask storage instructions are not supported");
+        if (is_written) {
+            // FMask reads currently use an identity sample mapping. Keep writes consistent with
+            // that approximation until guest FMask storage is implemented.
+            if (inst.GetOpcode() == IR::Opcode::ImageWrite) {
+                LOG_WARNING(Render_Recompiler,
+                            "Ignoring FMask image write in shader {:#x} under identity mapping",
+                            info.pgm_hash);
+                inst.Invalidate();
+                return;
+            }
+            ASSERT_MSG(false, "FMask atomic storage instructions are not supported");
+        }
 
         IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
         switch (inst.GetOpcode()) {
@@ -610,6 +694,13 @@ IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, const In
 
 void PatchBufferArgs(IR::Inst& inst, Info& info) {
     const auto handle = inst.Arg(0);
+    if (!handle.IsImmediate()) {
+        ASSERT(inst.GetOpcode() == IR::Opcode::StoreBufferU32 ||
+               inst.GetOpcode() == IR::Opcode::LoadBufferU32x3);
+        IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
+        inst.SetArg(IR::StoreBufferArgs::Address, CalculateDynamicBufferAddress(ir, inst, handle));
+        return;
+    }
     const auto buffer_res = info.buffers[handle.U32()];
     const auto buffer = buffer_res.GetSharp(info);
 

@@ -985,6 +985,9 @@ struct PM4CmdReleaseMem {
             // No interrupt
             break;
         }
+        case InterruptSelect::IrqOnly:
+            ASSERT(data_sel == DataSelect::None);
+            [[fallthrough]];
         case InterruptSelect::IrqUndocumented:
             [[fallthrough]];
         case InterruptSelect::IrqWhenWriteConfirm: {

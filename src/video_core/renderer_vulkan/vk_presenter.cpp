@@ -896,9 +896,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
         const vk::Extent2D extent = swapchain.GetExtent();
         const std::array pre_barriers{
-            vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eNone,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eNone,
+                .srcAccessMask = vk::AccessFlagBits2::eNone,
+                .dstStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .dstAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
                 .oldLayout = vk::ImageLayout::eUndefined,
                 .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -912,9 +914,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                     .layerCount = VK_REMAINING_ARRAY_LAYERS,
                 },
             },
-            vk::ImageMemoryBarrier{
-                .srcAccessMask = vk::AccessFlagBits::eColorAttachmentWrite,
-                .dstAccessMask = vk::AccessFlagBits::eColorAttachmentRead,
+            vk::ImageMemoryBarrier2{
+                .srcStageMask = vk::PipelineStageFlagBits2::eColorAttachmentOutput,
+                .srcAccessMask = vk::AccessFlagBits2::eColorAttachmentWrite,
+                .dstStageMask = vk::PipelineStageFlagBits2::eFragmentShader,
+                .dstAccessMask = vk::AccessFlagBits2::eShaderRead,
                 .oldLayout = vk::ImageLayout::eGeneral,
                 .newLayout = vk::ImageLayout::eShaderReadOnlyOptimal,
                 .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -932,9 +936,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
 
         bool swapchain_copied_for_screenshot = false;
 
-        cmdbuf.pipelineBarrier(vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::PipelineStageFlagBits::eColorAttachmentOutput,
-                               vk::DependencyFlagBits::eByRegion, {}, {}, pre_barriers);
+        cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+            .dependencyFlags = vk::DependencyFlagBits::eByRegion,
+            .imageMemoryBarrierCount = static_cast<u32>(pre_barriers.size()),
+            .pImageMemoryBarriers = pre_barriers.data(),
+        });
 
         { // Draw the game
             ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2{0.0f});
@@ -1066,8 +1072,10 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     }
 
     SubmitInfo info{};
-    info.AddWait(swapchain.GetImageAcquiredSemaphore());
-    info.AddWait(frame->ready_semaphore, frame->ready_tick);
+    info.AddWait(swapchain.GetImageAcquiredSemaphore(), 1,
+                 vk::PipelineStageFlagBits::eColorAttachmentOutput);
+    info.AddWait(frame->ready_semaphore, frame->ready_tick,
+                 vk::PipelineStageFlagBits::eFragmentShader);
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);

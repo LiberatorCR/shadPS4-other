@@ -736,6 +736,9 @@ std::span<const SurfaceFormatInfo> SurfaceFormats() {
         // BC5
         CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc5, AmdGpu::NumberFormat::Unorm,
                                 vk::Format::eBc5UnormBlock),
+        // UbnormNz is the OpenGL-style unsigned normalized variant used for image reads.
+        CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc5, AmdGpu::NumberFormat::UbnormNz,
+                                vk::Format::eBc5UnormBlock),
         CreateSurfaceFormatInfo(AmdGpu::DataFormat::FormatBc5, AmdGpu::NumberFormat::Snorm,
                                 vk::Format::eBc5SnormBlock),
         // BC6

@@ -15,6 +15,10 @@
 #endif
 namespace Core {
 
+#ifdef _WIN32
+void InstallGoTDependencyTrace(u64 eboot_base);
+#endif
+
 using AccessViolationHandler = bool (*)(void* context, void* fault_address);
 using IllegalInstructionHandler = bool (*)(void* context);
 

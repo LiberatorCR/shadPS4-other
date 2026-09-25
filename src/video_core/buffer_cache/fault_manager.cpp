@@ -13,7 +13,7 @@
 
 namespace VideoCore {
 
-static constexpr size_t MaxPageFaults = 1024;
+static constexpr size_t MaxPageFaults = 4096;
 static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
 
 FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
@@ -164,8 +164,16 @@ void FaultManager::ProcessFaultBuffer() {
     scheduler.DeferOperation([this, mapped, area = current_area] {
         fault_ranges.Clear();
         const u64* fault_buf = std::bit_cast<const u64*>(mapped);
-        const u32 fault_count = fault_buf[0];
+        const u32 fault_count =
+            static_cast<u32>(std::min<u64>(fault_buf[0], MaxPageFaults - 1));
+        if (fault_buf[0] > fault_count) {
+            LOG_WARNING(Render_Vulkan, "GPU fault list overflow: {} pages reported", fault_buf[0]);
+        }
         for (u32 i = 1; i <= fault_count; ++i) {
+            if (fault_buf[i] == 0) {
+                LOG_WARNING(Render_Vulkan, "GPU shader accessed unmapped guest address zero");
+                continue;
+            }
             fault_ranges.Add(fault_buf[i], sparse_pagesize);
             LOG_INFO(Render_Vulkan, "Accessed non-GPU cached memory at {:#x}", fault_buf[i]);
         }

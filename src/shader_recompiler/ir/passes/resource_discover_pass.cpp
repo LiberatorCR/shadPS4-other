@@ -254,7 +254,11 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        // A control-flow merge can select between descriptors fetched on separate paths.
+        // The merged value remains a runtime descriptor rather than a CPU-resolved SRT entry.
+        ASSERT_MSG(IsSharpSource(source) || source->GetOpcode() == IR::Opcode::Phi,
+                   "Unexpected descriptor dword source {} at index {}",
+                   IR::NameOf(source->GetOpcode()), i);
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);

@@ -116,6 +116,7 @@ struct ImageResource {
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_depth{};
     bool is_atomic{};
+    bool is_atomic_u32{};
     bool is_array{};
     bool is_written{};
     bool is_r128{};

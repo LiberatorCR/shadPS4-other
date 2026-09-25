@@ -59,7 +59,7 @@ Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
 
 Id EmitReadConst(EmitContext& ctx, IR::Inst* inst, Id addr, Id offset) {
     const u32 flatbuf_off_dw = inst->Flags<u32>();
-    if (!EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+    if (!ctx.info.uses_dma) {
         return ctx.EmitFlatbufferLoad(ctx.ConstU32(flatbuf_off_dw));
     }
     if (flatbuf_off_dw == 0) {
@@ -437,8 +437,29 @@ Id EmitLoadBufferU32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address)
     return EmitLoadBufferB32xN<2, PointerType::U32>(ctx, inst, handle, address);
 }
 
-Id EmitLoadBufferU32x3(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
-    return EmitLoadBufferB32xN<3, PointerType::U32>(ctx, inst, handle, address);
+Id EmitLoadBufferU32x3(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id address) {
+    if (handle.IsImmediate()) {
+        return EmitLoadBufferB32xN<3, PointerType::U32>(ctx, inst, handle.U32(), address);
+    }
+    const Id descriptor = ctx.Def(handle);
+    const Id base_lo = ctx.OpCompositeExtract(ctx.U32[1], descriptor, 0);
+    const Id base_hi = ctx.OpBitwiseAnd(ctx.U32[1],
+                                      ctx.OpCompositeExtract(ctx.U32[1], descriptor, 1),
+                                      ctx.ConstU32(0xffu));
+    const Id base = ctx.OpBitwiseOr(
+        ctx.U64, ctx.OpUConvert(ctx.U64, base_lo),
+        ctx.OpShiftLeftLogical(ctx.U64, ctx.OpUConvert(ctx.U64, base_hi), ctx.ConstU32(32u)));
+    const Id byte_offset = ctx.OpShiftLeftLogical(ctx.U32[1], address, ctx.ConstU32(2u));
+    const Id guest_address = ctx.OpIAdd(ctx.U64, base, ctx.OpUConvert(ctx.U64, byte_offset));
+
+    boost::container::static_vector<Id, 3> values;
+    for (u32 i = 0; i < 3; ++i) {
+        const Id word_address =
+            i == 0 ? guest_address
+                   : ctx.OpIAdd(ctx.U64, guest_address, ctx.Constant(ctx.U64, u64(i * 4u)));
+        values.push_back(ctx.EmitDwordMemoryRead(word_address, [&] { return ctx.u32_zero_value; }));
+    }
+    return ctx.OpCompositeConstruct(ctx.U32[3], values);
 }
 
 Id EmitLoadBufferU32x4(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address) {
@@ -514,8 +535,24 @@ void EmitStoreBufferU16(EmitContext& ctx, IR::Inst*, u32 handle, Id address, Id 
     ctx.OpStore(ptr, value);
 }
 
-void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {
-    EmitStoreBufferB32xN<1, PointerType::U32>(ctx, inst, handle, address, value);
+void EmitStoreBufferU32(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id address,
+                        Id value) {
+    if (handle.IsImmediate()) {
+        EmitStoreBufferB32xN<1, PointerType::U32>(ctx, inst, handle.U32(), address, value);
+        return;
+    }
+
+    const Id descriptor = ctx.Def(handle);
+    const Id base_lo = ctx.OpCompositeExtract(ctx.U32[1], descriptor, 0);
+    const Id base_hi = ctx.OpBitwiseAnd(ctx.U32[1],
+                                      ctx.OpCompositeExtract(ctx.U32[1], descriptor, 1),
+                                      ctx.ConstU32(0xffu));
+    const Id base = ctx.OpBitwiseOr(
+        ctx.U64, ctx.OpUConvert(ctx.U64, base_lo),
+        ctx.OpShiftLeftLogical(ctx.U64, ctx.OpUConvert(ctx.U64, base_hi), ctx.ConstU32(32u)));
+    const Id byte_offset = ctx.OpShiftLeftLogical(ctx.U32[1], address, ctx.ConstU32(2u));
+    const Id guest_address = ctx.OpIAdd(ctx.U64, base, ctx.OpUConvert(ctx.U64, byte_offset));
+    ctx.EmitDwordMemoryWrite(guest_address, value);
 }
 
 void EmitStoreBufferU32x2(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value) {

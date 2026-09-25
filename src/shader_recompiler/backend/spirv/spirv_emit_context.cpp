@@ -976,7 +976,7 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
         // When native fp32 image atomic min/max is unsupported the float atomics are
         // emulated as u32 bit-level atomics, so the image must be declared with an
         // unsigned integer format to match the u32 texel pointer type.
-        if (format == spv::ImageFormat::R32f && !ctx.profile.supports_image_fp32_atomic_min_max) {
+        if (desc.is_atomic_u32) {
             format = spv::ImageFormat::R32ui;
         }
     }
@@ -1008,9 +1008,7 @@ void EmitContext::DefineImagesAndSamplers() {
         // Float image atomics fall back to u32 bit-level atomics when native support is
         // unavailable; the image must then be declared as unsigned integer so all texel
         // accesses match its sampled type.
-        const bool atomic_u32_fallback = image_desc.is_atomic &&
-                                         nfmt == AmdGpu::NumberFormat::Float &&
-                                         !profile.supports_image_fp32_atomic_min_max;
+        const bool atomic_u32_fallback = image_desc.is_atomic_u32;
         const bool is_integer = atomic_u32_fallback || AmdGpu::IsInteger(nfmt);
         const bool is_storage = image_desc.is_written;
         const MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
@@ -1217,6 +1215,17 @@ Id EmitContext::DefineGetBdaPointer() {
     Name(func, "get_bda_pointer");
     AddLabel();
 
+    // Guest addresses above the emulated 40-bit aperture must not index the page table.
+    const auto valid_address_label{OpLabel()};
+    const auto invalid_address_label{OpLabel()};
+    const auto within_aperture{
+        OpULessThan(U1[1], address, Constant(U64, u64{1} << 40))};
+    OpSelectionMerge(valid_address_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(within_aperture, valid_address_label, invalid_address_label);
+    AddLabel(invalid_address_label);
+    OpReturnValue(u64_zero_value);
+    AddLabel(valid_address_label);
+
     const auto fault_label{OpLabel()};
     const auto available_label{OpLabel()};
     const auto merge_label{OpLabel()};
@@ -1243,9 +1252,10 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
     const auto fault_ptr{
         OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
-    const auto fault_value{OpLoad(U32[1], fault_ptr)};
-    const auto fault_value_masked{OpBitwiseOr(U32[1], fault_value, page_mask)};
-    OpStore(fault_ptr, fault_value_masked);
+    // Multiple lanes may fault on different pages represented by the same dword.
+    // A load/OR/store sequence can lose another lane's update.
+    OpAtomicOr(U32[1], fault_ptr, ConstU32(static_cast<u32>(spv::Scope::Device)),
+               ConstU32(static_cast<u32>(spv::MemorySemanticsMask::MaskNone)), page_mask);
 
     // Return null pointer
     const auto fallback_result{u64_zero_value};

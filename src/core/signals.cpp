@@ -11,6 +11,9 @@
 #include "core/signals.h"
 #include "emulator.h"
 
+#include <cstring>
+#include <cstdlib>
+
 #ifdef _WIN32
 #include <windows.h>
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
@@ -25,6 +28,107 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+static u64 got_dependency_trace_base{};
+
+void InstallGoTDependencyTrace(u64 eboot_base) {
+    struct TraceSite {
+        u64 offset;
+        std::initializer_list<u8> expected;
+    };
+    const TraceSite sites[] = {
+        {0xCECA8E, {0xF0, 0xFF, 0x05, 0x3F, 0x14, 0xF1, 0x02}},
+        {0xCECDE2, {0xE8, 0x79, 0x03, 0xB0, 0xFF}},
+        {0x7ED160, {0x55}},
+    };
+    for (const auto& site : sites) {
+        auto* address = reinterpret_cast<u8*>(eboot_base + site.offset);
+        if (std::memcmp(address, site.expected.begin(), site.expected.size()) != 0) {
+            LOG_WARNING(Debug, "GoT dependency trace: instruction mismatch at {:#x}",
+                        site.offset);
+            return;
+        }
+    }
+    for (const auto& site : sites) {
+        auto* address = reinterpret_cast<u8*>(eboot_base + site.offset);
+        DWORD old_protection{};
+        if (!VirtualProtect(address, 1, PAGE_EXECUTE_READWRITE, &old_protection)) {
+            LOG_WARNING(Debug, "GoT dependency trace: protection change failed at {:#x}",
+                        site.offset);
+            return;
+        }
+        *address = 0xCC;
+        FlushInstructionCache(GetCurrentProcess(), address, 1);
+        DWORD unused{};
+        VirtualProtect(address, 1, old_protection, &unused);
+    }
+    got_dependency_trace_base = eboot_base;
+    LOG_INFO(Debug, "GoT dependency trace armed at base {:#x}", eboot_base);
+}
+
+static bool HandleGoTDependencyTrace(EXCEPTION_POINTERS* exception) {
+    if (got_dependency_trace_base == 0 || exception->ExceptionRecord->ExceptionCode !=
+                                              EXCEPTION_BREAKPOINT) {
+        return false;
+    }
+    const u64 address = reinterpret_cast<u64>(exception->ExceptionRecord->ExceptionAddress);
+    const u64 offset = address - got_dependency_trace_base;
+    auto* count = reinterpret_cast<volatile LONG*>(got_dependency_trace_base + 0x3BFDED4);
+    if (offset == 0x7ED160) {
+        auto* context = exception->ContextRecord;
+        if (context->Rdi == got_dependency_trace_base + 0x3BFDED0) {
+            const u64 caller = *reinterpret_cast<u64*>(context->Rsp);
+            const u32 state =
+                *reinterpret_cast<volatile u32*>(got_dependency_trace_base + 0x3BFDED0);
+            static const bool guard_proxy_release =
+                std::getenv("SHADPS4_DIAG_GOT_GUARD_PROXY_RELEASE") != nullptr;
+            if (guard_proxy_release && caller - got_dependency_trace_base == 0xB897F8 &&
+                (state != 1 || *count <= 0)) {
+                LOG_INFO(Debug, "GoT diagnostic skipped stale proxy release count={} state={}",
+                         *count, state);
+                context->Rip = caller;
+                context->Rsp += sizeof(u64);
+                return true;
+            }
+            LOG_INFO(Debug, "GoT dependency decrement count={} state={} caller={:#x}",
+                     *count, state, caller - got_dependency_trace_base);
+            if (caller - got_dependency_trace_base == 0xB897F8) {
+                const u64 proxy = context->Rbx;
+                const auto slot = *reinterpret_cast<volatile s32*>(proxy + 0x1F1C);
+                const auto target = *reinterpret_cast<volatile u32*>(proxy + 0x1F18);
+                const auto table = *reinterpret_cast<u64*>(got_dependency_trace_base + 0x173C7C0);
+                const auto actual = *reinterpret_cast<volatile u32*>(table + static_cast<s64>(slot) * 8);
+                const auto eq = *reinterpret_cast<volatile s64*>(proxy + 0xF2E0);
+                LOG_INFO(Debug,
+                         "GoT ProxySetSync release proxy={:#x} slot={} actual={} target={} eq={}",
+                         proxy, slot, actual, target, eq);
+            }
+        }
+        context->Rsp -= sizeof(u64);
+        *reinterpret_cast<u64*>(context->Rsp) = context->Rbp;
+        context->Rip = got_dependency_trace_base + 0x7ED161;
+        return true;
+    }
+    if (offset == 0xCECA8E) {
+        const LONG before = *count;
+        const LONG after = InterlockedIncrement(count);
+        LOG_INFO(Debug, "GoT dependency increment count={} -> {} state={}", before, after,
+                 *reinterpret_cast<volatile u32*>(got_dependency_trace_base + 0x3BFDED0));
+        exception->ContextRecord->Rip = got_dependency_trace_base + 0xCECA95;
+        return true;
+    }
+    if (offset == 0xCECDE2) {
+        LOG_INFO(Debug, "GoT dependency release count={} state={} df60={}", *count,
+                 *reinterpret_cast<volatile u32*>(got_dependency_trace_base + 0x3BFDED0),
+                 *reinterpret_cast<volatile u32*>(got_dependency_trace_base + 0x3BFDF60));
+        auto* context = exception->ContextRecord;
+        context->Rsp -= sizeof(u64);
+        *reinterpret_cast<u64*>(context->Rsp) = got_dependency_trace_base + 0xCECDE7;
+        context->Rip = got_dependency_trace_base + 0x7ED160;
+        return true;
+    }
+    return false;
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -50,6 +154,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
 
     bool handled = false;
     bool static_protection_exception = false; // Windows static guest red-zone protection
+    if (code == EXCEPTION_BREAKPOINT && HandleGoTDependencyTrace(pExp)) {
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     switch (code) {
     case EXCEPTION_ACCESS_VIOLATION:
         guest_info._si_signo = POSIX_SIGSEGV;

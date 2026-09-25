@@ -9,14 +9,6 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
-# googletest upstream code triggers -Wcharacter-conversion under clang-cl; the project
-# compiles with -WX, which turns it into an error and breaks the gtest build.
-if (TARGET gtest AND CMAKE_CXX_COMPILER_ID STREQUAL "Clang" AND MSVC)
-    foreach(gt_target gtest gtest_main gmock gmock_main)
-        target_compile_options(${gt_target} PRIVATE -Wno-error -Wno-character-conversion)
-    endforeach()
-endif()
-
 set(TEST_TARGETS
     shadps4_settings_test
     shadps4_ngs2_test

@@ -172,6 +172,22 @@ public:
         return final_result;
     }
 
+    void EmitDwordMemoryWrite(Id address, Id value) {
+        const Id write_label = OpLabel();
+        const Id merge_label = OpLabel();
+        const Id addr = OpFunctionCall(U64, get_bda_pointer, address);
+        const Id is_available = OpINotEqual(U1[1], addr, u64_zero_value);
+        OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+        OpBranchConditional(is_available, write_label, merge_label);
+
+        AddLabel(write_label);
+        const Id addr_ptr = OpConvertUToPtr(physical_pointer_type_u32, addr);
+        OpStore(addr_ptr, value);
+        OpBranch(merge_label);
+
+        AddLabel(merge_label);
+    }
+
     Id EmitSharedMemoryAccess(const Id result_type, const Id shared_mem, const Id index) {
         if (std::popcount(static_cast<u32>(info.shared_types)) > 1) {
             return OpAccessChain(result_type, shared_mem, u32_zero_value, index);

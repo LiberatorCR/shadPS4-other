@@ -222,7 +222,6 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
 
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
-
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -820,6 +819,20 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
+        if (AmdGpu::IsFmask(tsharp.GetDataFmt())) {
+            LOG_WARNING(Render_Vulkan,
+                        "FMask descriptor reached Vulkan binding: shader={:#x} address={:#x} data_format={} num_format={} {}x{} written={}",
+                        stage.pgm_hash, tsharp.Address(),
+                        static_cast<u32>(tsharp.GetDataFmt()),
+                        static_cast<u32>(tsharp.GetNumberFmt()),
+                        static_cast<u32>(tsharp.width + 1),
+                        static_cast<u32>(tsharp.height + 1), image_desc.is_written);
+            // FMask reads are specialized to identity in the recompiler. If a runtime
+            // descriptor becomes FMask for a storage binding, leave it unbound as well.
+            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            image_descriptor_array_sizes.push_back(1);
+            continue;
+        }
         if (texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }

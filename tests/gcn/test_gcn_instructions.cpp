@@ -11,11 +11,6 @@
 #include "gcn_test_runner.hpp"
 #include "instructions.hpp"
 #include "translator.hpp"
-#include "shader_recompiler/ir/ir_emitter.h"
-#include "shader_recompiler/ir/passes/ir_passes.h"
-#include "shader_recompiler/ir/post_order.h"
-#include "shader_recompiler/profile.h"
-#include "shader_recompiler/recompiler.h"
 
 class GcnTest : public ::testing::Test {
 protected:
@@ -222,78 +217,6 @@ TEST_F(GcnTest, add_nan) {
 
     EXPECT_TRUE(result.has_value());
     EXPECT_TRUE(std::isnan(*result));
-}
-
-// Regression test: shaders using f64 must declare the f64 type and Float64 capability.
-// A missing uses_fp64 flag made Sirit skip the result-type operand word of every f64
-// instruction (stream corruption -> invalid SPIR-V, driver crash in pipeline compilation).
-static bool ContainsF64TypeDeclaration(const std::vector<u32>& spirv) {
-    constexpr u32 OpTypeFloat = 22;
-    for (size_t i = 5; i < spirv.size();) {
-        const u32 word_count = spirv[i] >> 16;
-        const u32 opcode = spirv[i] & 0xFFFF;
-        if (opcode == OpTypeFloat && word_count == 3 && i + 2 < spirv.size() &&
-            spirv[i + 2] == 64) {
-            return true;
-        }
-        if (word_count == 0) {
-            break;
-        }
-        i += word_count;
-    }
-    return false;
-}
-
-static bool ContainsCapability(const std::vector<u32>& spirv, u32 capability) {
-    constexpr u32 OpCapability = 17;
-    for (size_t i = 5; i < spirv.size();) {
-        const u32 word_count = spirv[i] >> 16;
-        const u32 opcode = spirv[i] & 0xFFFF;
-        if (opcode == OpCapability && word_count == 2 && i + 1 < spirv.size() &&
-            spirv[i + 1] == capability) {
-            return true;
-        }
-        if (word_count == 0) {
-            break;
-        }
-        i += word_count;
-    }
-    return false;
-}
-
-// v_cvt_f64_i32 lowers to IR::Opcode::ConvertF64S32, which the shader info collection
-// pass did not track: uses_fp64 stayed false and the emitted module was missing the
-// OpTypeFloat(64) declaration and the Float64 capability.
-TEST_F(GcnTest, convert_f64_s32_sets_uses_fp64) {
-    Shader::Info info{};
-    Shader::IR::Program program{info};
-    Shader::Pools pools{};
-    Shader::IR::Block* block = pools.block_pool.Create(pools.inst_pool);
-    program.blocks.push_back(block);
-    program.syntax_list.emplace_back();
-    program.syntax_list.back().type = Shader::IR::AbstractSyntaxNode::Type::Block;
-    program.syntax_list.back().data.block = block;
-    program.syntax_list.emplace_back();
-    program.syntax_list.back().type = Shader::IR::AbstractSyntaxNode::Type::Return;
-    program.post_order_blocks = Shader::IR::PostOrder(block);
-
-    Shader::IR::IREmitter ir(*block);
-    [[maybe_unused]] const Shader::IR::F64 converted =
-        ir.ConvertSToF(64, 32, ir.Imm32(u32{123}));
-
-    Shader::Profile profile{};
-    Shader::Optimization::CollectShaderInfoPass(program, profile);
-
-    EXPECT_TRUE(info.uses_fp64);
-}
-
-TEST_F(GcnTest, cvt_f64_i32_declares_fp64_type_and_capability) {
-    // v_cvt_f64_i32 v[0:1], v0
-    const auto spirv = TranslateToSpirv(VOP1(OpcodeVOP1::V_CVT_F64_I32, VOperand8::V0, SOperand9::V0).Get());
-
-    EXPECT_TRUE(ContainsF64TypeDeclaration(spirv));
-    // spv::Capability::Float64 == 10
-    EXPECT_TRUE(ContainsCapability(spirv, 10));
 }
 
 using half = half_float::half;

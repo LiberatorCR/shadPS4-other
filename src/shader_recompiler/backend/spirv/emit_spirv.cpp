@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -153,6 +154,9 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    const bool cap_all_fragment_loops = program.info.hw_stage == HwStage::Fragment &&
+                                        std::getenv("SHADPS4_DIAG_CAP_ALL_FS_LOOPS") != nullptr;
+    Id diagnostic_loop_counter{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
         case IR::AbstractSyntaxNode::Type::Block: {
@@ -162,6 +166,12 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (cap_all_fragment_loops && !Sirit::ValidId(diagnostic_loop_counter)) {
+                diagnostic_loop_counter = ctx.AddLocalVariable(
+                    ctx.TypePointer(spv::StorageClass::Function, ctx.U32[1]),
+                    spv::StorageClass::Function);
+                ctx.OpStore(diagnostic_loop_counter, ctx.u32_zero_value);
+            }
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 EmitInst(ctx, &inst);
             }
@@ -197,6 +207,13 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
             break;
         case IR::AbstractSyntaxNode::Type::Repeat: {
             Id cond{ctx.Def(node.data.repeat.cond)};
+            if (cap_all_fragment_loops) {
+                const Id count = ctx.OpLoad(ctx.U32[1], diagnostic_loop_counter);
+                const Id next = ctx.OpIAdd(ctx.U32[1], count, ctx.u32_one_value);
+                ctx.OpStore(diagnostic_loop_counter, next);
+                const Id within_limit = ctx.OpULessThan(ctx.U1[1], next, ctx.ConstU32(32u));
+                cond = ctx.OpLogicalAnd(ctx.U1[1], cond, within_limit);
+            }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
             const Id merge_label{node.data.repeat.merge->Definition<Id>()};
             ctx.OpBranchConditional(cond, loop_header_label, merge_label);
