@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <cstdlib>
 
 #include "common/alignment.h"
@@ -344,7 +345,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::OnGameLoaded();
 #ifdef _WIN32
-            if (std::getenv("SHADPS4_DIAG_GOT_DEP_TRACE")) {
+            if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DEP_TRACE">()) {
                 InstallGoTDependencyTrace(base_virtual_addr);
             }
 #endif

@@ -888,7 +888,9 @@ static bool TryExecuteIllegalInstruction(void* ctx, void* code_address) {
 
 static bool TryPatchJit(void* code_address) {
     auto* code = static_cast<u8*>(code_address);
-    auto* module = GetModule(code);
+    // GetModule returns the preceding module even when the address is past its end.
+    // An instruction-fetch fault must not turn into a second fault in the decoder.
+    auto* module = GetContainingModule(code);
     if (module == nullptr) {
         return false;
     }
@@ -2134,6 +2136,9 @@ static bool PatchesAccessViolationHandler(void* context, void* /* fault_address 
 
 static bool PatchesIllegalInstructionHandler(void* context) {
     void* code_address = Common::GetRip(context);
+    if (GetContainingModule(code_address) == nullptr) {
+        return false;
+    }
 #if defined(_WIN32)
     // Windows static guest red-zone protection
     const bool inspect_short_cpu_patch =

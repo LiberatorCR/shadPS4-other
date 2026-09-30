@@ -457,8 +457,13 @@ void ParseInputConfig(const std::string game_id = "") {
         } else if (output_string == "key_toggle") {
             if (comma_pos != std::string::npos) {
                 // handle key-to-key toggling (separate list?)
-                InputBinding toggle_keys = GetBindingFromString(input_string);
-                if (toggle_keys.KeyCount() != 2) {
+                // InputBinding sorts chord keys. A toggle is ordered: the first
+                // key activates the second, so parse them separately.
+                auto toggler_string = input_string.substr(0, comma_pos);
+                auto target_string = input_string.substr(comma_pos + 1);
+                const auto toggler = GetBindingFromString(toggler_string);
+                const auto target = GetBindingFromString(target_string);
+                if (toggler.KeyCount() != 1 || target.KeyCount() != 1) {
                     LOG_WARNING(Input,
                                 "Syntax error: Please provide exactly 2 keys: "
                                 "first is the toggler, the second is the key to toggle: {}",
@@ -468,7 +473,7 @@ void ParseInputConfig(const std::string game_id = "") {
                 ControllerOutput* toggle_out =
                     &*std::ranges::find(output_arrays[0].data, ControllerOutput(KEY_TOGGLE));
                 BindingConnection toggle_connection = BindingConnection(
-                    InputBinding(toggle_keys.keys[0]), toggle_out, 0, toggle_keys.keys[1]);
+                    toggler, toggle_out, 0, target.keys[0]);
                 connections.insert(connections.end(), toggle_connection);
                 return;
             }
@@ -919,9 +924,6 @@ InputEvent BindingConnection::ProcessBinding() {
     // and the analog inputs are always the last one due to how they are sorted,
     // so this signifies whether or not the input is analog
     InputEvent event = InputEvent(binding.keys[0]);
-    if (pressed_keys.empty()) {
-        return event;
-    }
     if (event.input.type != InputType::Axis) {
         // for button inputs
         event.axis_value = axis_param;

@@ -176,6 +176,7 @@ int EqueueInternal::WaitForEvents(OrbisKernelEvent* ev, int num, const OrbisKern
     if (timo != nullptr && *timo == 0) {
         // Effectively acts as a poll; only events that have already
         // arrived at the time of this function call can be received
+        std::scoped_lock lock{m_mutex};
         return GetTriggeredEvents(ev, num);
     }
     const auto micros = timo ? *timo : 0u;

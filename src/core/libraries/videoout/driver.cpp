@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -11,7 +12,11 @@
 #include "core/libraries/videoout/videoout_error.h"
 #include "imgui/renderer/imgui_core.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+
+#include <atomic>
+#include <cstdlib>
 
 extern std::unique_ptr<Vulkan::Presenter> presenter;
 extern std::unique_ptr<AmdGpu::Liverpool> liverpool;
@@ -234,6 +239,31 @@ int VideoOutDriver::ChangeBufferAttribute(VideoOutPort* port, s32 attributeIndex
 }
 
 void VideoOutDriver::Flip(const Request& req) {
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_AUTO_SCREENSHOT">() != nullptr) {
+        static std::atomic<u64> flip_count = 0;
+        static const u64 screenshot_period = [] {
+            const char* text = Common::DiagnosticEnv<"SHADPS4_DIAG_AUTO_SCREENSHOT_PERIOD">();
+            if (!text) {
+                return 300ull;
+            }
+            char* end = nullptr;
+            const auto value = std::strtoull(text, &end, 10);
+            return end != text && *end == '\0' && value >= 30 && value <= 600 ? value : 300ull;
+        }();
+        const u64 count = ++flip_count;
+        if (count == 60 || count == 180 ||
+            (count >= 300 && count <= 7200 && count % screenshot_period == 0)) {
+            VideoCore::RequestScreenshot(VideoCore::ScreenshotRequest::GameOnly);
+        }
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_FLIP_TRACE">() != nullptr) {
+        static u64 presented_count = 0;
+        const u64 count = ++presented_count;
+        if (count <= 5 || count % 120 == 0) {
+            LOG_INFO(Lib_VideoOut, "DIAG presented flip {} index={} eop={}", count, req.index,
+                     req.eop);
+        }
+    }
     // Update HDR status before presenting.
     presenter->SetHDR(req.port->is_hdr);
 
@@ -291,6 +321,14 @@ void VideoOutDriver::DrawLastFrame() {
 
 bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
                                 bool is_eop /*= false*/) {
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_FLIP_TRACE">() != nullptr) {
+        static std::atomic<u64> submitted_count = 0;
+        const u64 count = ++submitted_count;
+        if (count <= 5 || count % 120 == 0) {
+            LOG_INFO(Lib_VideoOut, "DIAG submitted flip {} index={} eop={}", count, index,
+                     is_eop);
+        }
+    }
     {
         std::unique_lock lock{port->port_mutex};
         if (index != -1 && port->flip_status.flip_pending_num > 16) {
