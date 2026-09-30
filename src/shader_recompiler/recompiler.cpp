@@ -144,7 +144,6 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
-    Shader::Optimization::LowerHardwareIntrinsics(program);
     if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
         LOG_INFO(Render_Recompiler, "GoT scene dynamic image leaving IR lowering");
     }
@@ -172,6 +171,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
+    Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);

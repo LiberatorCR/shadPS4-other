@@ -3,6 +3,7 @@
 
 #include "common/diagnostic_env.h"
 #include <cstdlib>
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <utility>
