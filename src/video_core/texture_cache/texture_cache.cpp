@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
+#include <cstdlib>
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -51,12 +53,16 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     const s64 mem_threshold = std::min<s64>(device_local_memory, TARGET_GC_THRESHOLD);
     const s64 min_vacancy_expected = (6 * mem_threshold) / 10;
     const s64 min_vacancy_critical = (2 * mem_threshold) / 10;
+    const s64 min_pressure_floor =
+        std::clamp<s64>(device_local_memory / 4, 256_MB, DEFAULT_PRESSURE_GC_MEMORY);
+    const s64 min_critical_floor =
+        std::clamp<s64>(device_local_memory / 2, 512_MB, DEFAULT_CRITICAL_GC_MEMORY);
     pressure_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
-                      DEFAULT_PRESSURE_GC_MEMORY));
+        std::max<s64>(std::min(device_local_memory - min_vacancy_expected, min_spacing_expected),
+                      min_pressure_floor));
     critical_gc_memory = static_cast<u64>(
-        std::max<u64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
-                      DEFAULT_CRITICAL_GC_MEMORY));
+        std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
+                      min_critical_floor));
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
 }
 
@@ -154,6 +160,22 @@ void TextureCache::InvalidateMemory(VAddr addr, size_t size) {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(VAddr address, size_t max_size) {
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_TILE_REFRESH">() &&
+        (address == 0x1406a30000 || address == 0x1406c70000 ||
+         address == 0x1406eb0000)) {
+        LOG_INFO(Render_Vulkan, "GoT tile atlas buffer invalidation address={:#x} size={}",
+                 address, max_size);
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_INVALIDATE">() &&
+        (address == 0x144fd30000 || address == 0x144fd78000 ||
+         address == 0x144fd40000 || address == 0x144fd88000)) {
+        static u32 reported_weather_invalidates = 0;
+        if (reported_weather_invalidates++ < 32) {
+            LOG_INFO(Render_Vulkan,
+                     "GoT weather GPU invalidation address={:#x} size={} buffer_gpu_modified={}",
+                     address, max_size, buffer_cache.IsRegionGpuModified(address, max_size));
+        }
+    }
     std::scoped_lock lock{mutex};
     ForEachImageInRegion(address, max_size, [&](ImageId image_id, Image& image) {
         // Only consider images that match base address.
@@ -233,12 +255,15 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         RegisterImage(new_image_id);
 
         // Inherit image usage
+        // Insertion can grow SlotVector and move every image. Reacquire the
+        // source by ID instead of using the reference obtained before insertion.
+        auto& source_image = slot_images[cache_image_id];
         auto& new_image = slot_images[new_image_id];
-        new_image.usage = cache_image.usage;
+        new_image.usage = source_image.usage;
         new_image.flags &= ~ImageFlagBits::Dirty;
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
-        runtime.CopyColorAndDepth(&cache_image, &new_image);
+        runtime.CopyColorAndDepth(&source_image, &new_image);
 
         // Free the cache image.
         FreeImage(cache_image_id);
@@ -572,6 +597,20 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
     image.tick_accessed_last = scheduler.CurrentTick();
     TouchImage(image);
 
+    if (info.guest_address == 0x143dd50000 &&
+        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_3D_LUT_CACHE">()) {
+        static u32 reported = 0;
+        if (reported++ < 12) {
+            LOG_INFO(Render_Vulkan,
+                     "GoT 3D LUT cache: requested={}x{}x{} pitch={} tile={} bytes={:#x} "
+                     "cached={}x{}x{} bytes={:#x} flags={:#x} overlapping={} id={}",
+                     info.size.width, info.size.height, info.size.depth, info.pitch,
+                     static_cast<u32>(info.tile_mode), info.guest_size, image.info.size.width,
+                     image.info.size.height, image.info.size.depth, image.info.guest_size,
+                     static_cast<u32>(image.flags), image_ids.size(), image_id.index);
+        }
+    }
+
     // If the image requested is a subresource of the image from cache record its location.
     if (view_mip > 0) {
         desc.view_info.range.base.level = view_mip;
@@ -686,10 +725,11 @@ ImageView& TextureCache::FindDepthTarget(ImageId image_id, const ImageDesc& desc
         }
         Image& stencil_image = slot_images[stencil_id];
         TouchImage(stencil_image);
-        stencil_image.AssociateDepth(image_id, image.image_uid);
+        stencil_image.AssociateDepth(image_id, slot_images[image_id].image_uid);
     }
 
-    return image.FindView(desc.view_info, false);
+    // Creating the stencil image may have moved the depth image as well.
+    return slot_images[image_id].FindView(desc.view_info, false);
 }
 
 void TextureCache::RefreshImage(Image& image) {
@@ -763,6 +803,36 @@ void TextureCache::RefreshImage(Image& image) {
     if (image_copies.empty()) {
         image.flags &= ~ImageFlagBits::Dirty;
         return;
+    }
+
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_TILE_REFRESH">() &&
+        (image.info.guest_address == 0x1406a30000 ||
+         image.info.guest_address == 0x1406c70000 ||
+         image.info.guest_address == 0x1406eb0000)) {
+        LOG_INFO(Render_Vulkan,
+                 "GoT tile atlas refresh address={:#x} flags={:#x} "
+                 "gpu_modified_image={} gpu_dirty_image={} gpu_modified_buffer={} "
+                 "mip_copies={}",
+                 image.info.guest_address, static_cast<u32>(image.flags), is_gpu_modified,
+                 is_gpu_dirty,
+                 buffer_cache.IsRegionGpuModified(image.info.guest_address,
+                                                  image.info.guest_size),
+                 image_copies.size());
+    }
+
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_REFRESH">() &&
+        (image.info.guest_address == 0x144fd30000 ||
+         image.info.guest_address == 0x144fd78000 ||
+         image.info.guest_address == 0x144fd40000 ||
+         image.info.guest_address == 0x144fd88000)) {
+        LOG_INFO(Render_Vulkan,
+                 "GoT weather refresh address={:#x} flags={:#x} gpu_modified_image={} "
+                 "gpu_dirty_image={} gpu_modified_buffer={} mip_copies={} guest_size={}",
+                 image.info.guest_address, static_cast<u32>(image.flags), is_gpu_modified,
+                 is_gpu_dirty,
+                 buffer_cache.IsRegionGpuModified(image.info.guest_address,
+                                                  image.info.guest_size),
+                 image_copies.size(), image.info.guest_size);
     }
 
     scheduler.EndRendering();

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <algorithm>
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -93,7 +95,6 @@ void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
     }
-    DebugState.num_batches_per_frame = std::exchange(num_flushes_per_frame, 0u);
 }
 
 void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_locks) {
@@ -103,6 +104,16 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_FLUSH">() &&
+        device_addr < 0x144fd90000 && device_addr + size > 0x144fd18000) {
+        static u32 reported_weather_reads = 0;
+        if (reported_weather_reads++ < 32) {
+            LOG_INFO(Render_Vulkan,
+                     "GoT weather buffer read request address={:#x} size={} is_write={} "
+                     "assume_locks={}",
+                     device_addr, size, is_write, assume_locks);
+        }
+    }
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -129,6 +140,9 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
+    const bool trace_weather_download =
+        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_FLUSH">() &&
+        device_addr < 0x144fd90000 && device_addr + size > 0x144fd18000;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -150,7 +164,20 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
+        if (trace_weather_download) {
+            static u32 reported_empty_weather_downloads = 0;
+            if (reported_empty_weather_downloads++ < 8) {
+                LOG_INFO(Render_Vulkan,
+                         "GoT weather buffer download empty window={:#x}+{}", device_addr,
+                         size);
+            }
+        }
         return;
+    }
+    if (trace_weather_download) {
+        LOG_INFO(Render_Vulkan,
+                 "GoT weather buffer download window={:#x}+{} copies={} total_bytes={}",
+                 device_addr, size, copies.size(), total_size_bytes);
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
@@ -160,10 +187,28 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
+    static u32 reported_weather_copy_contents = 0;
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
-                                copy.size);
+        const auto* src_addr = download.mapped + (copy.dstOffset - download.offset);
+        u64 source_nonzero = 0;
+        if (trace_weather_download && reported_weather_copy_contents < 24) {
+            for (u64 j = 0; j < copy.size; ++j) {
+                source_nonzero += src_addr[j] != 0;
+            }
+        }
+        memory->TryWriteBacking(dst_addr, src_addr, copy.size);
+        if (trace_weather_download && reported_weather_copy_contents < 24) {
+            ++reported_weather_copy_contents;
+            u64 guest_nonzero = 0;
+            for (u64 j = 0; j < copy.size; ++j) {
+                guest_nonzero += dst_addr[j] != 0;
+            }
+            LOG_INFO(Render_Vulkan,
+                     "GoT weather buffer copied address={:#x} size={} gpu_nonzero={} "
+                     "guest_nonzero={}",
+                     arena_base + copy.srcOffset, copy.size, source_nonzero, guest_nonzero);
+        }
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
@@ -181,9 +226,23 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const u64 last_block = (device_addr + size - 1) >> block_shift;
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
-    sync_batch.Add(device_addr, device_addr + size, is_written);
-    if (is_texel_buffer && !is_written) {
-        SynchronizeMemoryFromImage(arena, device_addr, size);
+    SynchronizeMemory(arena, device_addr, size, is_written, false);
+    const char* weather_mask_text = Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SYNC_WEATHER_SOURCE_MASK">();
+    const u32 weather_mask = weather_mask_text
+                                 ? static_cast<u32>(std::strtoul(weather_mask_text, nullptr, 0))
+                                 : 3u;
+    const bool weather_raw_image_copy =
+        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SYNC_WEATHER_RAW_IMAGE">() && !is_written &&
+        (((weather_mask & 1u) &&
+          (device_addr == 0x144fd18000 || device_addr == 0x144fd28000)) ||
+         ((weather_mask & 2u) &&
+          (device_addr == 0x144fd60000 || device_addr == 0x144fd70000)));
+    if ((is_texel_buffer || weather_raw_image_copy) && !is_written) {
+        const bool synchronized = SynchronizeMemoryFromImage(arena, device_addr, size);
+        if (weather_raw_image_copy) {
+            LOG_INFO(Render_Vulkan, "GoT weather raw image sync address={:#x} size={} found={}",
+                     device_addr, size, synchronized);
+        }
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -202,19 +261,12 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_add
     return {staging.buffer, staging.offset};
 }
 
+bool BufferCache::IsRegionCpuModified(VAddr addr, size_t size) {
+    return memory_tracker->IsRegionCpuModified(addr, size);
+}
+
 bool BufferCache::IsRegionGpuModified(VAddr addr, size_t size) {
-    if (memory_tracker->IsRegionGpuModified(addr, size)) {
-        return true;
-    }
-    const VAddr start = Common::AlignDown(addr, BYTES_PER_PAGE);
-    const VAddr end = Common::AlignUp(addr + size, BYTES_PER_PAGE);
-    auto it = std::ranges::upper_bound(sync_batch, start, {}, &SyncRange::end);
-    for (; it != sync_batch.end() && it->start < end; ++it) {
-        if (it->written) {
-            return true;
-        }
-    }
-    return false;
+    return memory_tracker->IsRegionGpuModified(addr, size);
 }
 
 void BufferCache::SynchronizeDmaBuffers() {
@@ -223,7 +275,7 @@ void BufferCache::SynchronizeDmaBuffers() {
         const u64 page = range.start >> (ARENA_PAGE_BITS - block_shift);
         const VAddr device_addr = range.start << block_shift;
         const u64 size = (range.end - range.start) << block_shift;
-        sync_batch.Add(device_addr, device_addr + size, false);
+        SynchronizeMemory(address_space[page], device_addr, size, false, false);
     }
 }
 
@@ -313,6 +365,7 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
         backing.end = range.end;
         backing.memory = device_memory;
         backing.offset = memory_offset;
+        backing.block_shift = block_shift;
         resident_ranges.Add(backing);
 
         LOG_INFO(Render, "Making range start={}, end={} resident", backing.start, backing.end);
@@ -335,6 +388,30 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 
     staging.Flush();
     runtime.CopyBuffer(staging.buffer, bda_pagetable_buffer.get(), copies);
+}
+
+bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
+                                    bool is_written, bool is_texel_buffer) {
+    boost::container::small_vector<vk::BufferCopy, 4> copies;
+    size_t total_size_bytes{};
+    memory_tracker->ForEachUploadRange(device_addr, size, is_written, [&](u64 addr, u64 size) {
+        copies.emplace_back(total_size_bytes, addr, size);
+        total_size_bytes += size;
+    });
+    if (!copies.empty()) {
+        const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
+        for (auto& copy : copies) {
+            memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
+            copy.srcOffset += staging.offset;
+            copy.dstOffset -= arena->cpu_addr;
+        }
+        staging.Flush();
+        runtime.CopyBuffer(staging.buffer, arena, copies);
+    }
+    if (is_texel_buffer && !is_written) {
+        return SynchronizeMemoryFromImage(arena, device_addr, size);
+    }
+    return false;
 }
 
 bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
@@ -421,101 +498,12 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     info.AddWait(signal_sema, signal_tick);
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();
-}
-
-void BufferCache::FlushSyncBatch(bool from_scheduler) {
-    boost::container::small_vector<vk::BufferCopy, 32> copies;
-    size_t total_size_bytes = 0;
-    for (const auto& range : sync_batch) {
-        memory_tracker->ForEachUploadRange(
-            range.start, range.end - range.start, range.written, [&](u64 addr, u64 range_size) {
-                copies.emplace_back(total_size_bytes, addr, range_size);
-                total_size_bytes += range_size;
-            });
-    }
-    sync_batch.Clear();
-    if (copies.empty()) {
-        return;
-    }
-    const auto staging = staging_pool.Request(total_size_bytes, MemoryType::HostUncached);
-    for (auto& copy : copies) {
-        memory->CopySparseMemory(copy.dstOffset, staging.mapped + copy.srcOffset, copy.size);
-        copy.srcOffset += staging.offset;
-    }
-    staging.Flush();
-
-    const auto cmdbuf = scheduler.UploadCommandBuffer();
-
-    u32 batch_start = 0;
-    u32 batch_end = 0;
-
-    while (true) {
-        batch_start = batch_end;
-        const auto& copy = copies[batch_start];
-        const auto* arena = address_space[copy.dstOffset >> ARENA_PAGE_BITS];
-
-        const auto expand_batch = [&] {
-            const auto& copy = copies[batch_end];
-            const auto end_page = (copy.dstOffset + copy.size - 1) >> ARENA_PAGE_BITS;
-            return address_space[end_page] == arena;
-        };
-        const auto flush_batch = [&] {
-            const auto regions = std::span{copies}.subspan(batch_start, batch_end - batch_start);
-            for (auto& copy : regions) {
-                copy.dstOffset -= arena->cpu_addr;
-            }
-            cmdbuf.copyBuffer(staging.buffer->Handle(), arena->Handle(), regions);
-        };
-
-        while (batch_end < copies.size() && expand_batch()) {
-            ++batch_end;
-        }
-
-        // No more copies to examine.
-        if (batch_end == copies.size()) {
-            flush_batch();
-            break;
-        }
-
-        // Next copy does not overlap with the current buffer.
-        auto end_copy = copies[batch_end];
-        const auto* end_arena = address_space[end_copy.dstOffset >> ARENA_PAGE_BITS];
-        if (end_arena != arena) {
-            flush_batch();
-            continue;
-        }
-
-        // Next copy partially overlaps with buffer.
-        const auto copy_size = end_arena->cpu_addr + end_arena->size_bytes - end_copy.dstOffset;
-        copies[batch_end].size = copy_size;
-        end_copy.srcOffset += copy_size;
-        end_copy.dstOffset += copy_size;
-        end_copy.size -= copy_size;
-        ++batch_end;
-        flush_batch();
-        --batch_end;
-        copies[batch_end] = end_copy;
-    }
-
-    const vk::MemoryBarrier2 memory_barrier = {
-        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
-        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
-        .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
-    };
-    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
-        .dependencyFlags = vk::DependencyFlagBits::eByRegion,
-        .memoryBarrierCount = 1u,
-        .pMemoryBarriers = &memory_barrier,
-    });
-    num_flushes_per_frame++;
-
-    if (!from_scheduler) {
-        scheduler.BeginSession();
-    }
 }
 
 } // namespace VideoCore

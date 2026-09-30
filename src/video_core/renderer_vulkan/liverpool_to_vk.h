@@ -61,7 +61,10 @@ struct SurfaceFormatInfo {
 };
 std::span<const SurfaceFormatInfo> SurfaceFormats();
 
-vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format);
+/// `where` only appears in diagnostics; it names the binding site so a rejected descriptor can be
+/// attributed without guessing from surrounding log lines.
+vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format,
+                         const char* where = nullptr);
 
 struct DepthFormatInfo {
     AmdGpu::DepthBuffer::ZFormat z_format;

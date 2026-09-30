@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <ranges>
 
 #include "common/hash.h"
@@ -222,6 +223,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         const auto& cs_pgm = liverpool->GetCsRegs();
         info.props.num_user_data = cs_pgm.settings.num_user_regs;
         info.props.num_allocated_vgprs = cs_pgm.settings.num_vgprs * 4;
+        info.props.fp_denorm_mode32 = cs_pgm.settings.fp_denorm_mode32;
+        info.props.fp_denorm_mode16_64 = cs_pgm.settings.fp_denorm_mode64;
+        info.props.fp_round_mode32 = cs_pgm.settings.fp_round_mode32;
+        info.props.fp_round_mode16_64 = cs_pgm.settings.fp_round_mode64;
         info.hw.cs.workgroup_size = {cs_pgm.num_thread_x.full, cs_pgm.num_thread_y.full,
                                      cs_pgm.num_thread_z.full};
         info.hw.cs.tgid_enable = {cs_pgm.IsTgidEnabled(0), cs_pgm.IsTgidEnabled(1),
@@ -602,8 +607,8 @@ bool PipelineCache::RefreshGraphicsStages() {
             ASSERT_MSG(vertex_binding < MaxVertexBufferCount,
                        "Vertex attribute binding count exceeded limit: {} >= {}", vertex_binding,
                        MaxVertexBufferCount);
-            key.vertex_buffer_formats[vertex_binding++] =
-                Vulkan::LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt());
+            key.vertex_buffer_formats[vertex_binding++] = Vulkan::LiverpoolToVK::SurfaceFormat(
+                buffer.GetDataFmt(), buffer.GetNumberFmt(), "PipelineCache vertex attribute");
         }
     }
 
@@ -627,8 +632,23 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Vulkan, "GoT scene dynamic image entering SPIR-V emission");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic entering SPIR-V emission");
+    }
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Vulkan, "GoT scene dynamic image leaving SPIR-V emission");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic leaving SPIR-V emission");
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic dumped SPIR-V words={}", spv.size());
+    }
 
     vk::ShaderModule module;
 
@@ -639,6 +659,9 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
         module = CompileSPV(*patch, instance.GetDevice());
     } else {
         module = CompileSPV(spv, instance.GetDevice());
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic compiled shader module");
     }
 
     RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
@@ -662,7 +685,13 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         auto& program = it_pgm.value();
         auto start = binding;
         const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && params.hash == 0xff484786) {
+            LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic GetProgram compiled module");
+        }
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && params.hash == 0xff484786) {
+            LOG_INFO(Render_Vulkan, "GoT dynamic image diagnostic GetProgram specialized");
+        }
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -738,7 +767,8 @@ std::string PipelineCache::GetShaderName(Shader::HwStage stage, u64 hash,
 
 void PipelineCache::DumpShader(std::span<const u32> code, u64 hash, Shader::HwStage stage,
                                size_t perm_idx, std::string_view ext) {
-    if (!EmulatorSettings.IsDumpShaders()) {
+    if (!EmulatorSettings.IsDumpShaders() &&
+        !(hash == 0xb0db526b && Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_B0_DYNAMIC_IMAGES">())) {
         return;
     }
 

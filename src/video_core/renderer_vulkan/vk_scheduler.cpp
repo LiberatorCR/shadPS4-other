@@ -194,11 +194,11 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     }
 #endif
 
-    EndSession();
-
     if (on_submit) {
         on_submit(info);
     }
+
+    EndSession();
 
     std::vector<vk::CommandBuffer> cmd_buffers;
     cmd_buffers.reserve(sessions.size() * 2);
@@ -234,6 +234,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();
@@ -420,7 +423,8 @@ void DynamicState::Commit(const Instance& instance, const vk::CommandBuffer& cmd
         dirty_state.line_width = false;
         cmdbuf.setLineWidth(line_width);
     }
-    if (dirty_state.feedback_loop_enabled && instance.IsAttachmentFeedbackLoopLayoutSupported()) {
+    if (dirty_state.feedback_loop_enabled &&
+        instance.IsAttachmentFeedbackLoopDynamicStateSupported()) {
         dirty_state.feedback_loop_enabled = false;
         cmdbuf.setAttachmentFeedbackLoopEnableEXT(feedback_loop_enabled
                                                       ? vk::ImageAspectFlagBits::eColor

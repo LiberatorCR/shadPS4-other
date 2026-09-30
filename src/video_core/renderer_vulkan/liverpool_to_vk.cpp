@@ -783,12 +783,19 @@ static auto surface_format_table = []() constexpr {
     return result;
 }();
 
-vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
-    vk::Format result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
-    bool found =
-        result != vk::Format::eUndefined || data_format == AmdGpu::DataFormat::FormatInvalid;
-    ASSERT_MSG(found, "Unknown data_format={} and num_format={}", static_cast<u32>(data_format),
-               static_cast<u32>(num_format));
+vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format,
+                         const char* where) {
+    vk::Format result = vk::Format::eUndefined;
+    bool in_range =
+        u32(data_format) < (1 << amd_gpu_data_format_bit_size) &&
+        u32(num_format) < (1 << amd_gpu_number_format_bit_size);
+    if (in_range) {
+        result = surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+    }
+    bool found = result != vk::Format::eUndefined ||
+                 data_format == AmdGpu::DataFormat::FormatInvalid;
+    ASSERT_MSG(found, "Unknown data_format={} and num_format={}{}", static_cast<u32>(data_format),
+               static_cast<u32>(num_format), where ? fmt::format(" at {}", where).c_str() : "");
     return result;
 }
 

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <span>
 #include <unordered_map>
 
@@ -47,6 +48,9 @@ public:
     vk::Device GetDevice() const {
         return *device;
     }
+
+    /// Logs driver-provided fault details after VK_ERROR_DEVICE_LOST, when opted in.
+    void LogDeviceFault() const;
 
     /// Returns the VMA allocator handle
     VmaAllocator GetAllocator() const {
@@ -122,6 +126,10 @@ public:
     /// Returns true if VK_EXT_attachment_feedback_loop_layout is supported
     bool IsAttachmentFeedbackLoopLayoutSupported() const {
         return attachment_feedback_loop;
+    }
+
+    bool IsAttachmentFeedbackLoopDynamicStateSupported() const {
+        return attachment_feedback_loop_dynamic_state;
     }
 
     /// Returns true when VK_EXT_custom_border_color is supported
@@ -440,6 +448,11 @@ public:
         return image_view_min_lod;
     }
 
+    /// Returns whether shaderStorageImageMultisample is supported.
+    bool IsMultisampleStorageImageSupported() const {
+        return features.shaderStorageImageMultisample;
+    }
+
     /// Returns whether the device can report memory usage.
     bool CanReportMemoryUsage() const {
         return supports_memory_budget;
@@ -525,11 +538,14 @@ private:
     bool maintenance_5{};
     bool maintenance_8{};
     bool attachment_feedback_loop{};
+    bool attachment_feedback_loop_dynamic_state{};
     bool image_2d_view_of_3d{};
     bool image_view_min_lod{};
     bool shader_clock{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool device_fault{};
+    mutable std::atomic_bool fault_reported{false};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

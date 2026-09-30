@@ -60,6 +60,7 @@ struct Liverpool {
     };
 
     Regs regs{};
+    bool diag_got_pm4_window{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 

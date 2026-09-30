@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <boost/container/static_vector.hpp>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
@@ -264,15 +266,30 @@ bool Instance::CreateDevice() {
                "Required Vulkan feature unavailable: nullDescriptor");
 
     // Optional
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_DEVICE_FAULT">() &&
+        std::find(available_extensions.begin(), available_extensions.end(),
+                  VK_EXT_DEVICE_FAULT_EXTENSION_NAME) != available_extensions.end()) {
+        const auto fault_features = physical_device.getFeatures2<
+            vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFaultFeaturesEXT>();
+        if (fault_features.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault) {
+            device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        } else {
+            LOG_WARNING(Render_Vulkan, "Device fault reporting is not supported by this GPU");
+        }
+    } else if (Common::DiagnosticEnv<"SHADPS4_DIAG_DEVICE_FAULT">()) {
+        LOG_WARNING(Render_Vulkan, "Device fault extension is not supported by this GPU");
+    }
     maintenance_5 = add_extension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     maintenance_8 = add_extension(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
     attachment_feedback_loop = add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_LAYOUT_EXTENSION_NAME);
     if (attachment_feedback_loop) {
-        attachment_feedback_loop =
+        attachment_feedback_loop_dynamic_state =
             add_extension(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
-        if (!attachment_feedback_loop) {
+        if (!attachment_feedback_loop_dynamic_state &&
+            !Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_STATIC_FEEDBACK">()) {
             // We want both extensions so remove the first if the second isn't available
             enabled_extensions.pop_back();
+            attachment_feedback_loop = false;
         }
     }
     depth_range_unrestricted = add_extension(VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
@@ -413,6 +430,8 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                .shaderSampledImageArrayDynamicIndexing =
+                    features.shaderSampledImageArrayDynamicIndexing,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -433,6 +452,9 @@ bool Instance::CreateDevice() {
             .shaderSharedInt64Atomics = vk12_features.shaderSharedInt64Atomics,
             .shaderFloat16 = vk12_features.shaderFloat16,
             .shaderInt8 = vk12_features.shaderInt8,
+            .descriptorIndexing = vk12_features.descriptorIndexing,
+            .shaderSampledImageArrayNonUniformIndexing =
+                vk12_features.shaderSampledImageArrayNonUniformIndexing,
             .scalarBlockLayout = vk12_features.scalarBlockLayout,
             .uniformBufferStandardLayout = vk12_features.uniformBufferStandardLayout,
             .separateDepthStencilLayouts = vk12_features.separateDepthStencilLayouts,
@@ -523,6 +545,9 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = device_fault,
+        },
     };
 
     if (!custom_border_color) {
@@ -557,6 +582,8 @@ bool Instance::CreateDevice() {
     }
     if (!attachment_feedback_loop) {
         device_chain.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopLayoutFeaturesEXT>();
+    }
+    if (!attachment_feedback_loop_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceAttachmentFeedbackLoopDynamicStateFeaturesEXT>();
     }
     if (!shader_atomic_float2) {
@@ -573,6 +600,9 @@ bool Instance::CreateDevice() {
     }
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
+    }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
     }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
@@ -620,6 +650,61 @@ bool Instance::CreateDevice() {
 
     CreateAllocator();
     return true;
+}
+
+void Instance::LogDeviceFault() const {
+    if (fault_reported.exchange(true)) {
+        return;
+    }
+    if (!device_fault || !VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT) {
+        LOG_WARNING(Render_Vulkan, "Device fault report unavailable");
+        return;
+    }
+
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    const VkDevice vk_device = static_cast<VkDevice>(*device);
+    auto result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(vk_device, &counts, nullptr);
+    if (result != VK_SUCCESS) {
+        LOG_WARNING(Render_Vulkan, "Device fault count query failed: {}", vk::to_string(vk::Result{result}));
+        return;
+    }
+
+    // Bound crash-path allocations. Vendor binaries are deliberately not requested.
+    constexpr u32 max_records = 4096;
+    const u32 address_count = std::min(counts.addressInfoCount, max_records);
+    const u32 vendor_count = std::min(counts.vendorInfoCount, max_records);
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(address_count);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(vendor_count);
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendors.data();
+    counts.addressInfoCount = address_count;
+    counts.vendorInfoCount = vendor_count;
+    counts.vendorBinarySize = 0;
+    result = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceFaultInfoEXT(vk_device, &counts, &info);
+    if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+        LOG_WARNING(Render_Vulkan, "Device fault detail query failed: {}", vk::to_string(vk::Result{result}));
+        return;
+    }
+
+    const auto description = [](const char* data) {
+        return std::string_view{data, static_cast<size_t>(
+                                          std::find(data, data + VK_MAX_DESCRIPTION_SIZE, '\0') - data)};
+    };
+    LOG_CRITICAL(Render_Vulkan, "Device fault: '{}' ({} addresses, {} vendor records, result {})",
+                 description(info.description), counts.addressInfoCount, counts.vendorInfoCount,
+                 vk::to_string(vk::Result{result}));
+    for (u32 i = 0; i < std::min(counts.addressInfoCount, address_count); ++i) {
+        const auto& address = addresses[i];
+        LOG_CRITICAL(Render_Vulkan, "  address {}: type {}, address {:#x}, precision {}", i,
+                     vk::to_string(vk::DeviceFaultAddressTypeEXT{address.addressType}),
+                     address.reportedAddress, address.addressPrecision);
+    }
+    for (u32 i = 0; i < std::min(counts.vendorInfoCount, vendor_count); ++i) {
+        const auto& vendor = vendors[i];
+        LOG_CRITICAL(Render_Vulkan, "  vendor {}: '{}', code {:#x}, data {:#x}", i,
+                     description(vendor.description), vendor.vendorFaultCode, vendor.vendorFaultData);
+    }
 }
 
 void Instance::CreateAllocator() {
@@ -708,7 +793,7 @@ void Instance::CollectPhysicalMemoryInfo() {
     // Leave at least 8 GB for the system on integrated GPUs.
     const s64 available_memory = static_cast<s64>(total_memory_budget - device_initial_usage);
     total_memory_budget =
-        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(local_memory)));
+        static_cast<u64>(std::max<s64>(available_memory - 8_GB, static_cast<s64>(2_GB)));
 }
 
 void Instance::CollectImageFormatInfo() {

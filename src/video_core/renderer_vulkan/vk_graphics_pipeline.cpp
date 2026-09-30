@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <algorithm>
 #include <utility>
 #include <boost/container/small_vector.hpp>
@@ -155,6 +156,9 @@ GraphicsPipeline::GraphicsPipeline(
     if (instance.IsDynamicColorWriteMaskSupported()) {
         dynamic_states.push_back(vk::DynamicState::eColorWriteMaskEXT);
     }
+    if (instance.IsAttachmentFeedbackLoopDynamicStateSupported()) {
+        dynamic_states.push_back(vk::DynamicState::eAttachmentFeedbackLoopEnableEXT);
+    }
     if (instance.IsVertexInputDynamicState()) {
         dynamic_states.push_back(vk::DynamicState::eVertexInputEXT);
     } else if (!sdata.vertex_bindings.empty()) {
@@ -255,7 +259,7 @@ GraphicsPipeline::GraphicsPipeline(
     std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];
-        const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format);
+        const auto format = LiverpoolToVK::SurfaceFormat(col_buf.data_format, col_buf.num_format, "GraphicsPipeline color attachment");
         const auto color_format =
             instance.GetSupportedFormat(format, vk::FormatFeatureFlagBits2::eColorAttachment);
         if (!instance.IsFormatSupported(color_format,
@@ -405,6 +409,11 @@ GraphicsPipeline::GraphicsPipeline(
 
     const vk::GraphicsPipelineCreateInfo pipeline_info = {
         .pNext = &pipeline_rendering_ci,
+        .flags = instance.IsAttachmentFeedbackLoopLayoutSupported() &&
+                         !instance.IsAttachmentFeedbackLoopDynamicStateSupported()
+                     ? vk::PipelineCreateFlags{
+                           vk::PipelineCreateFlagBits::eColorAttachmentFeedbackLoopEXT}
+                     : vk::PipelineCreateFlags{},
         .stageCount = static_cast<u32>(shader_stages.size()),
         .pStages = shader_stages.data(),
         .pVertexInputState = !instance.IsVertexInputDynamicState() ? &vertex_input_info : nullptr,
@@ -446,7 +455,7 @@ void GraphicsPipeline::GetVertexInputs(
         attributes.push_back(Attribute{
             .location = attrib.semantic,
             .binding = attrib.semantic,
-            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
+            .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt(), "GraphicsPipeline vertex buffer"),
             .offset = 0,
         });
         bindings.push_back(Binding{
@@ -523,6 +532,14 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         }
     }
     uses_push_descriptors = binding < instance.MaxPushDescriptors();
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() &&
+        std::ranges::any_of(stages, [](const Shader::Info* stage) {
+            return stage && stage->pgm_hash == 0xff484786;
+        })) {
+        LOG_INFO(Render_Vulkan,
+                 "GoT dynamic image diagnostic layout slots={} bindings={} max_push={} use_push={}",
+                 binding, bindings.size(), instance.MaxPushDescriptors(), uses_push_descriptors);
+    }
     const auto flags = uses_push_descriptors
                            ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
                            : vk::DescriptorSetLayoutCreateFlagBits{};
