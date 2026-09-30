@@ -2,7 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <cmath>
+#include <bit>
+#include <limits>
 #include <unordered_map>
+#include <utility>
 
 #include <gtest/gtest.h>
 #include <half.hpp>
@@ -11,6 +14,160 @@
 #include "gcn_test_runner.hpp"
 #include "instructions.hpp"
 #include "translator.hpp"
+#include "shader_recompiler/ir/ir_emitter.h"
+#include "shader_recompiler/ir/resource_use_guard.h"
+#include "shader_recompiler/ir/passes/ir_passes.h"
+#include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/profile.h"
+#include "shader_recompiler/runtime_info.h"
+
+TEST(ShaderSharedMemory, StorageFallbackUsesTypedIndicesAcrossWorkgroups) {
+    for (int operation = 0; operation < 4; ++operation) {
+        const int bits = operation == 0 ? 16 : operation == 1 ? 32 : 64;
+        Shader::Info info{};
+        info.hw_stage = Shader::HwStage::Compute;
+        Shader::IR::Program program{info};
+        Common::ObjectPool<Shader::IR::Inst> pool{64};
+        Shader::IR::Block block{pool};
+        program.blocks.push_back(&block);
+        Shader::IR::IREmitter ir{block};
+        const Shader::IR::Value value = operation == 3
+            ? Shader::IR::Value{ir.SharedAtomicIAdd(
+                  ir.Imm32(16), Shader::IR::U32U64{ir.Imm64(u64{1})}, false)}
+            : ir.LoadShared(bits, false, ir.Imm32(16));
+        ir.WriteShared(bits, value, ir.Imm32(24));
+        Shader::RuntimeInfo runtime{};
+        runtime.hw.cs.shared_memory_size = 64;
+        Shader::Profile profile{};
+        profile.max_shared_memory_size = 0;
+        Shader::Optimization::SharedMemoryToStoragePass(program, runtime, profile);
+        ASSERT_EQ(info.buffers.size(), 1);
+        EXPECT_EQ(info.buffers[0].buffer_type, Shader::BufferType::SharedMemory);
+        for (auto& inst : block.Instructions()) {
+            if (inst.GetOpcode() == Shader::IR::Opcode::GetAttributeU32) {
+                inst.ReplaceUsesWith(ir.Imm32(3));
+            }
+        }
+        Shader::Optimization::ConstantPropagationPass(program.blocks);
+        int reads = 0, writes = 0;
+        for (const auto& inst : block.Instructions()) {
+            switch (inst.GetOpcode()) {
+            case Shader::IR::Opcode::LoadBufferU16:
+            case Shader::IR::Opcode::LoadBufferU32:
+            case Shader::IR::Opcode::LoadBufferU64:
+            case Shader::IR::Opcode::BufferAtomicIAdd64:
+                ASSERT_TRUE(inst.Arg(1).IsImmediate());
+                EXPECT_EQ(inst.Arg(1).U32(), (3 * 64 + 16) / (bits / 8));
+                ++reads;
+                break;
+            case Shader::IR::Opcode::StoreBufferU16:
+            case Shader::IR::Opcode::StoreBufferU32:
+            case Shader::IR::Opcode::StoreBufferU64:
+                ASSERT_TRUE(inst.Arg(1).IsImmediate());
+                EXPECT_EQ(inst.Arg(1).U32(), (3 * 64 + 24) / (bits / 8));
+                ++writes;
+                break;
+            default:
+                break;
+            }
+        }
+        EXPECT_EQ(reads, 1);
+        EXPECT_EQ(writes, 1);
+    }
+}
+
+TEST(ShaderHardwareIntrinsics, PackedAncillaryPreservesMultipleExtracts) {
+    Shader::Info info{};
+    Shader::IR::Program program{info};
+    Common::ObjectPool<Shader::IR::Inst> pool{64};
+    Shader::IR::Block block{pool};
+    program.blocks.push_back(&block);
+    Shader::IR::IREmitter ir{block};
+    const auto packed = ir.GetAttributeU32(Shader::IR::Attribute::PackedAncillary);
+    const auto sample = ir.BitFieldExtract(packed, ir.Imm32(8), ir.Imm32(4));
+    const auto target = ir.BitFieldExtract(packed, ir.Imm32(16), ir.Imm32(11));
+    const auto sum = ir.IAdd(sample, target);
+    Shader::Optimization::LowerHardwareIntrinsics(program);
+    ASSERT_FALSE(sum.Inst()->Arg(0).IsImmediate());
+    ASSERT_FALSE(sum.Inst()->Arg(1).IsImmediate());
+    EXPECT_EQ(sum.Inst()->Arg(0).Inst()->Arg(0).Attribute(), Shader::IR::Attribute::SampleIndex);
+    EXPECT_EQ(sum.Inst()->Arg(1).Inst()->Arg(0).Attribute(), Shader::IR::Attribute::RenderTargetIndex);
+}
+
+TEST(ShaderResourceUse, ScalarGuardRequiresADominatingEdge) {
+    Common::ObjectPool<Shader::IR::Inst> inst_pool{64};
+    Shader::IR::Block entry{inst_pool}, conditional{inst_pool}, output{inst_pool}, exit{inst_pool};
+    Shader::Gcn::Block cfg{};
+    Shader::Gcn::Block output_cfg{}, exit_cfg{};
+    output_cfg.ir_block = &output;
+    exit_cfg.ir_block = &exit;
+    cfg.branch_true = &exit_cfg;
+    cfg.branch_false = &output_cfg;
+    conditional.cfg_block = &cfg;
+    entry.AddBranch(&conditional);
+    conditional.AddBranch(&exit);
+    conditional.AddBranch(&output);
+    output.AddBranch(&exit);
+    Shader::IR::IREmitter ir{conditional};
+    auto count = ir.ReadConst(ir.CompositeConstruct(ir.Imm32(0), ir.Imm32(0)), ir.Imm32(0));
+    count.Inst()->SetFlags(16u);
+    conditional.branch_cond = ir.ConditionRef(ir.ILessThan(count, ir.Imm32(4), false));
+    const Shader::IR::BlockList blocks{&entry, &conditional, &output, &exit};
+    auto guard = Shader::Optimization::FindImageUseGuard(blocks, &output);
+    EXPECT_EQ(guard.offset, 16u);
+    EXPECT_EQ(guard.limit, 4u);
+    std::array<u32, 17> flatbuf{};
+    flatbuf[16] = 3;
+    EXPECT_FALSE(guard.Active(flatbuf));
+    flatbuf[16] = 4;
+    EXPECT_TRUE(guard.Active(flatbuf));
+    // The join is reachable on either edge, so it cannot inherit the guard.
+    EXPECT_EQ(Shader::Optimization::FindImageUseGuard(blocks, &exit).offset,
+              Shader::UNKNOWN_LOCATION);
+    // Another path into the output makes this edge non-dominating.
+    entry.AddBranch(&output);
+    EXPECT_EQ(Shader::Optimization::FindImageUseGuard(blocks, &output).offset,
+              Shader::UNKNOWN_LOCATION);
+}
+
+TEST(ShaderInterpolation, MixedComponentsKeepTheirModesInEitherInstructionOrder) {
+    for (const bool amd : {false, true}) {
+        for (const bool mov_first : {false, true}) {
+            const auto code = TranslateMixedInterpolationToSpirv(amd, mov_first);
+            std::unordered_map<u32, std::unordered_map<u32, u32>> decorations;
+            for (size_t offset = 5; offset < code.size();) {
+                const u32 count = code[offset] >> 16;
+                ASSERT_GT(count, 0u);
+                ASSERT_LE(offset + count, code.size());
+                if ((code[offset] & 0xffffu) == u32(spv::Op::OpDecorate) && count >= 3) {
+                    decorations[code[offset + 1]][code[offset + 2]] = count > 3 ? code[offset + 3] : 0;
+                }
+                offset += count;
+            }
+            u32 found = 0;
+            for (const auto& [id, dec] : decorations) {
+                if (!dec.contains(u32(spv::Decoration::Component))) {
+                    continue;
+                }
+                ASSERT_TRUE(dec.contains(u32(spv::Decoration::Location)));
+                EXPECT_EQ(dec.at(u32(spv::Decoration::Location)), 3u);
+                const auto component = dec.at(u32(spv::Decoration::Component));
+                const auto per_vertex = u32(amd ? spv::Decoration::ExplicitInterpAMD
+                                               : spv::Decoration::PerVertexKHR);
+                if (component == 0) {
+                    EXPECT_TRUE(dec.contains(u32(spv::Decoration::Sample)));
+                    EXPECT_FALSE(dec.contains(per_vertex));
+                } else {
+                    EXPECT_EQ(component, 1u);
+                    EXPECT_TRUE(dec.contains(per_vertex));
+                    EXPECT_FALSE(dec.contains(u32(spv::Decoration::Sample)));
+                }
+                ++found;
+            }
+            EXPECT_EQ(found, 2u);
+        }
+    }
+}
 
 class GcnTest : public ::testing::Test {
 protected:
@@ -22,6 +179,64 @@ protected:
         gcn_test::Runner::DestroyInstance();
     }
 };
+
+TEST_F(GcnTest, bfm_uses_five_bit_width_and_offset) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(VOP2(OpcodeVOP2::V_BFM_B32, VOperand8::V0,
+                                          SOperand9::V0, VOperand8::V1).Get());
+    for (const auto width : {0U, 16U, 31U, 32U, 49U}) {
+        for (const auto offset : {0U, 16U, 31U, 32U, 49U}) {
+            const auto result = runner->run<u32>(spirv, std::array{width, offset, 0U, 0U});
+            ASSERT_TRUE(result.has_value());
+            EXPECT_EQ(*result, ((1U << (width & 31)) - 1U) << (offset & 31));
+        }
+    }
+}
+
+TEST_F(GcnTest, align_handles_zero_and_wrapped_shifts) {
+    auto runner = gcn_test::Runner::instance().value();
+    constexpr u32 high = 0x81234567, low = 0xfedcba98;
+    for (const auto opcode : {OpcodeVOP3::V_ALIGNBIT_B32, OpcodeVOP3::V_ALIGNBYTE_B32}) {
+        const auto spirv = TranslateToSpirv(VOP3A(opcode, VOperand8::V0, SOperand9::V0,
+                                                SOperand9::V1, SOperand9::V2).Get());
+        for (const auto input : {0U, 1U, 3U, 4U, 16U, 31U, 32U, 63U}) {
+            const auto result = runner->run<u32>(spirv, std::array{high, low, input, 0U});
+            ASSERT_TRUE(result.has_value());
+            const u32 shift = opcode == OpcodeVOP3::V_ALIGNBIT_B32 ? input & 31 : (input & 3) * 8;
+            EXPECT_EQ(*result, u32(((u64{high} << 32) | low) >> shift));
+        }
+    }
+}
+
+TEST(GcnDataShare, IndexedGdsUsesM0ByteBase) {
+    for (const auto operation :
+         {DataShareTestOperation::Read, DataShareTestOperation::Write, DataShareTestOperation::Add,
+          DataShareTestOperation::CompareExchange}) {
+        EXPECT_EQ(TranslateDataShareAddresses(operation, true, 0x07000040, 12),
+                  (std::vector<u32>{0x710}));
+        EXPECT_EQ(TranslateDataShareAddresses(operation, true, 0x09280040, 12),
+                  (std::vector<u32>{0x938}));
+    }
+}
+
+TEST(GcnDataShare, PairedGdsOffsetsAreDwordsAfterByteBase) {
+    for (const auto operation :
+         {DataShareTestOperation::ReadPair, DataShareTestOperation::WritePair}) {
+        EXPECT_EQ(TranslateDataShareAddresses(operation, true, 0x07000040, 12),
+                  (std::vector<u32>{0x71c, 0x728}));
+    }
+}
+
+TEST(GcnDataShare, LdsDoesNotUseM0AsAddressBase) {
+    for (const auto operation :
+         {DataShareTestOperation::Read, DataShareTestOperation::Write, DataShareTestOperation::Add,
+          DataShareTestOperation::CompareExchange}) {
+        EXPECT_EQ(TranslateDataShareAddresses(operation, false, 0x07000040, 12),
+                  (std::vector<u32>{16}));
+    }
+    EXPECT_EQ(TranslateDataShareAddresses(DataShareTestOperation::ReadPair, false, 0x07000040, 12),
+              (std::vector<u32>{28, 40}));
+}
 
 struct F32x2 {
     float a;
@@ -162,6 +377,33 @@ TEST_F(GcnTest, amd_barycentrics_use_native_pull_model) {
     EXPECT_EQ(info.frag_coord_count, 0U);
     EXPECT_EQ(info.bary_coord_khr_count, 0U);
     EXPECT_EQ(info.fmul_count, 0U);
+}
+
+TEST_F(GcnTest, interp_mov_selects_p10_p20_and_p0) {
+    const auto p10 = TranslateFragmentInterpMovSelector(0, false, false);
+    EXPECT_EQ(p10.attribute_indices, (std::vector<u32>{1U, 0U}));
+    EXPECT_EQ(p10.fsub_count, 1U);
+
+    const auto p20 = TranslateFragmentInterpMovSelector(1, false, false);
+    EXPECT_EQ(p20.attribute_indices, (std::vector<u32>{2U, 0U}));
+    EXPECT_EQ(p20.fsub_count, 1U);
+
+    const auto p0 = TranslateFragmentInterpMovSelector(2, false, false);
+    EXPECT_EQ(p0.attribute_indices, (std::vector<u32>{0U}));
+    EXPECT_EQ(p0.fsub_count, 0U);
+}
+
+TEST_F(GcnTest, interp_mov_uses_vertex_values_only_for_passthrough_inputs) {
+    for (const auto [flat_shade, offset5] :
+         {std::pair{false, false}, std::pair{true, false}, std::pair{false, true}}) {
+        const auto p10 = TranslateFragmentInterpMovSelector(0, flat_shade, offset5);
+        EXPECT_EQ(p10.attribute_indices, (std::vector<u32>{1U, 0U}));
+        EXPECT_EQ(p10.fsub_count, 1U);
+    }
+
+    const auto p10 = TranslateFragmentInterpMovSelector(0, true, true);
+    EXPECT_EQ(p10.attribute_indices, (std::vector<u32>{1U}));
+    EXPECT_EQ(p10.fsub_count, 0U);
 }
 
 // Example
@@ -697,6 +939,17 @@ TEST_F(GcnTest, bitcmp1_b64_bit32) {
     auto result = runner->run<u32>(spirv, std::array{0U, 1U, 32U, 0U});
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 1U);
+    for (const u32 bit : {0U, 31U, 32U, 63U}) {
+        const u64 value = u64{1} << bit;
+        for (const u32 position : {bit, bit + 64}) {
+            auto set = runner->run<u32>(spirv, std::array{u32(value), u32(value >> 32), position, 0U});
+            ASSERT_TRUE(set.has_value());
+            EXPECT_EQ(*set, 1U);
+            auto clear = runner->run<u32>(spirv, std::array{0U, 0U, position, 0U});
+            ASSERT_TRUE(clear.has_value());
+            EXPECT_EQ(*clear, 0U);
+        }
+    }
 }
 
 TEST_F(GcnTest, subb_u32_clears_vcc) {
@@ -711,4 +964,92 @@ TEST_F(GcnTest, subb_u32_clears_vcc) {
     auto result = runner->run<u32>(spirv, std::array{0U, 1U, 5U, 0U});
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, 0U);
+}
+
+TEST_F(GcnTest, subb_u32_scc_wrap) {
+    auto runner = gcn_test::Runner::instance().value();
+    const std::array<u64, 4> instructions{
+        SOP2(OpcodeSOP2::S_ADD_U32, SOperand7::S3, SOperand8::S0, SOperand8::S1).Get(),
+        SOP2(OpcodeSOP2::S_SUBB_U32, SOperand7::S3, SOperand8::Const0, SOperand8::S2).Get(),
+        SOP2(OpcodeSOP2::S_CSELECT_B32, SOperand7::S0, SOperand8::Const1, SOperand8::Const0).Get(),
+        VOP1(OpcodeVOP1::V_MOV_B32, VOperand8::V0, SOperand9::S0).Get(),
+    };
+    const auto spirv = TranslateToSpirv(instructions);
+
+    auto result = runner->run<u32>(spirv, std::array{0xffffffffU, 1U, 0xffffffffU, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 1U);
+}
+
+TEST_F(GcnTest, addc_u32_clears_scc) {
+    auto runner = gcn_test::Runner::instance().value();
+    const std::array<u64, 4> instructions{
+        SOP2(OpcodeSOP2::S_ADD_U32, SOperand7::S3, SOperand8::S0, SOperand8::S1).Get(),
+        SOP2(OpcodeSOP2::S_ADDC_U32, SOperand7::S3, SOperand8::Const0, SOperand8::Const0).Get(),
+        SOP2(OpcodeSOP2::S_CSELECT_B32, SOperand7::S0, SOperand8::Const1, SOperand8::Const0).Get(),
+        VOP1(OpcodeVOP1::V_MOV_B32, VOperand8::V0, SOperand9::S0).Get(),
+    };
+    const auto spirv = TranslateToSpirv(instructions);
+
+    auto result = runner->run<u32>(spirv, std::array{0xffffffffU, 1U, 0U, 0U});
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 0U);
+}
+
+TEST_F(GcnTest, addc_u32_result_uses_scc) {
+    auto runner = gcn_test::Runner::instance().value();
+    const std::array<u64, 3> instructions{
+        SOP2(OpcodeSOP2::S_ADD_U32, SOperand7::S1, SOperand8::S0, SOperand8::S1).Get(),
+        SOP2(OpcodeSOP2::S_ADDC_U32, SOperand7::S0, SOperand8::S2, SOperand8::S3).Get(),
+        VOP1(OpcodeVOP1::V_MOV_B32, VOperand8::V0, SOperand9::S0).Get(),
+    };
+    const auto spirv = TranslateToSpirv(instructions);
+
+    auto overflow = runner->run<u32>(spirv, std::array{0xffffffffU, 1U, 7U, 0U});
+    ASSERT_TRUE(overflow.has_value());
+    EXPECT_EQ(*overflow, 8U);
+
+    auto no_overflow = runner->run<u32>(spirv, std::array{2U, 1U, 7U, 0U});
+    ASSERT_TRUE(no_overflow.has_value());
+    EXPECT_EQ(*no_overflow, 7U);
+}
+
+TEST_F(GcnTest, group_minimum_partial_subgroup) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto single = TranslateGroupMinimumToSpirv(1);
+    auto one = runner->run<u32>(single, std::array{7u, 0u, 0u, 0u});
+    ASSERT_TRUE(one.has_value());
+    EXPECT_EQ(*one, 71u);
+    const auto partial = TranslateGroupMinimumToSpirv(3);
+    auto three = runner->run<std::array<u32, 3>>(partial, std::array{7u, 0u, 0u, 0u});
+    ASSERT_TRUE(three.has_value());
+    EXPECT_EQ(*three, (std::array{69u, 69u, 69u}));
+}
+
+TEST_F(GcnTest, cvt_pk_u8_console_rounding_saturation_and_selector) {
+    auto runner = gcn_test::Runner::instance().value();
+    const auto spirv = TranslateToSpirv(
+        VOP3A(OpcodeVOP3::V_CVT_PK_U8_F32, VOperand8::V0,
+              SOperand9::V0, SOperand9::V1, SOperand9::V2).Get());
+    struct Case { float value; u32 selector; u32 expected; };
+    const Case cases[] = {
+        {0.5f, 0, 0x11223300}, {1.5f, 0, 0x11223302},
+        {2.5f, 0, 0x11223302}, {127.5f, 0, 0x11223380},
+        {255.5f, 0, 0x112233ff}, {300.0f, 0, 0x112233ff},
+        {-1.0f, 0, 0x11223300},
+        {std::numeric_limits<float>::infinity(), 0, 0x112233ff},
+        {-std::numeric_limits<float>::infinity(), 0, 0x11223300},
+        {std::numeric_limits<float>::quiet_NaN(), 0, 0x11223300},
+        {171.0f, 0, 0x112233ab}, {171.0f, 1, 0x1122ab44},
+        {171.0f, 2, 0x11ab3344}, {171.0f, 3, 0xab223344},
+        {171.0f, 4, 0x112233ab}, {171.0f, 5, 0x1122ab44},
+        {171.0f, 7, 0xab223344}, {171.0f, 0xffffffff, 0xab223344},
+    };
+    for (const auto& item : cases) {
+        SCOPED_TRACE(item.selector);
+        const auto result = runner->run<u32>(spirv,
+            std::array{std::bit_cast<u32>(item.value), item.selector, u32{0x11223344}});
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(*result, item.expected);
+    }
 }

@@ -39,6 +39,12 @@ set(SETTINGS_TEST_SOURCES
     test_emulator_settings.cpp
     # Windows static guest red-zone protection
     test_windows_guest_red_zone_protection_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/libraries/kernel/equeue.cpp
+    test_equeue.cpp
+    test_pm4_fences.cpp
+    test_wave_minimum.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/frontend/instruction.cpp
+    stubs/equeue_stub.cpp
 )
 
 set(NGS2_TEST_SOURCES
@@ -160,6 +166,8 @@ set(GCN_TEST_SOURCES
 
     # Tests
     gcn/test_gcn_instructions.cpp
+    ../src/shader_recompiler/ir/passes/lower_hardware_intrinsics.cpp
+    ../src/shader_recompiler/ir/passes/shared_memory_to_storage_pass.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})
@@ -182,6 +190,11 @@ target_link_libraries(shadps4_settings_test PRIVATE
     toml11::toml11
     SDL3::SDL3
     spdlog::spdlog
+    Boost::headers
+    magic_enum::magic_enum
+    Tracy::TracyClient
+    tsl::robin_map
+    xbyak::xbyak
 )
 target_link_libraries(shadps4_ngs2_test PRIVATE
     GTest::gtest_main
@@ -338,3 +351,5 @@ gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DISCOVERY_TIMEOUT 60
 )
+set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/network/http_test_environment.cmake")

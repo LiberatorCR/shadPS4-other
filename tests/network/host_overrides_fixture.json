@@ -1,0 +1,4 @@
+{
+    "api.example.com": "localhost:8080",
+    "*": "mock.local:8443"
+}
