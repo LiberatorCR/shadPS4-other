@@ -1924,7 +1924,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             LOG_INFO(Render_Vulkan,
                      "GoT B0 mesh submit={} draw={} vs={:#x} fetch_shader={} buffers={}",
                      diag_draw_trace.submit_index, captured_args, vs.pgm_hash,
-                     pipeline->GetFetchShader().has_value(), vs.buffers.size());
+                     !pipeline->GetFetchShader().Empty(), vs.buffers.size());
             for (u32 i = 0; i < vs.buffers.size() && i < 16; ++i) {
                 const auto& descriptor = vs.buffers[i];
                 if (descriptor.IsSpecial()) {

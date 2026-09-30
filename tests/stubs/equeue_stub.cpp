@@ -5,6 +5,10 @@
 #include "core/file_sys/fs.h"
 #include "core/loader/symbols_resolver.h"
 
+void LinkSymbolImpl(Core::Loader::SymbolsResolver* sym, char const* nid, char const* lib,
+                    u16 libversion, char const* mod, u64 symbol,
+                    Core::Loader::SymbolType sym_type) {}
+
 namespace Libraries::Kernel {
 boost::asio::io_context io_context;
 void KernelSignalRequest() {}
