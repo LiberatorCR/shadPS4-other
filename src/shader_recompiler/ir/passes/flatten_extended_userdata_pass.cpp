@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <unordered_map>
 #include <boost/container/flat_map.hpp>
 #include <queue>
@@ -748,6 +749,45 @@ void SimplifyReadConstAddressAdd(IR::Inst& inst) {
 void FlattenExtendedUserdataPass(IR::Program& program) {
     auto& post_order = program.post_order_blocks;
     PassInfo pass_info;
+
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SKY_NOISE_IMAGES">() &&
+        (program.info.pgm_hash == 0x3c2e229a || program.info.pgm_hash == 0x11d5a4b7)) {
+        for (IR::Block* block : program.blocks) {
+            for (IR::Inst& inst : *block) {
+                if (inst.GetOpcode() != IR::Opcode::ReadConst) {
+                    continue;
+                }
+                const auto* shift = inst.Arg(1).TryInst();
+                const auto* add = shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32 &&
+                                          shift->Arg(1).IsImmediate() && shift->Arg(1).U32() == 2
+                                      ? shift->Arg(0).TryInst()
+                                      : nullptr;
+                const auto* tile = add && add->GetOpcode() == IR::Opcode::IAdd32 &&
+                                           add->Arg(1).IsImmediate()
+                                       ? add->Arg(0).TryInst()
+                                       : nullptr;
+                if (!tile || tile->GetOpcode() != IR::Opcode::ShiftLeftLogical32 ||
+                    !tile->Arg(1).IsImmediate() || tile->Arg(1).U32() != 2 ||
+                    (add->Arg(1).U32() != 268 && add->Arg(1).U32() != 280)) {
+                    continue;
+                }
+                IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+                const IR::U32 index{tile->Arg(0)};
+                const u32 first = add->Arg(1).U32() / sizeof(u32);
+                const IR::U32 first_value = ir.ReadConst(inst.Arg(0), ir.Imm32(first));
+                const IR::U32 second_value = ir.ReadConst(inst.Arg(0), ir.Imm32(first + 1));
+                const IR::U32 third_value = ir.ReadConst(inst.Arg(0), ir.Imm32(first + 2));
+                const IR::U32 selected{ir.Select(
+                    ir.IEqual(index, ir.Imm32(0)), first_value,
+                    ir.Select(ir.IEqual(index, ir.Imm32(1)), second_value, third_value))};
+                inst.ReplaceUsesWith(selected);
+                inst.Invalidate();
+                LOG_INFO(Render_Recompiler,
+                         "GoT sky noise SRT loop weight unrolled shader={:#x} first_dword={}",
+                         program.info.pgm_hash, first);
+            }
+        }
+    }
 
     // traverse at end and assign offsets to duplicate readconsts, using
     // vn_to_inst as the source

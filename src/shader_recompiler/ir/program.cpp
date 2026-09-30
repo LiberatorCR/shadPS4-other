@@ -2,12 +2,16 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
+#include <cerrno>
+#include <cstdlib>
 #include <map>
 #include <string>
 
 #include <fmt/format.h>
 
 #include "common/io_file.h"
+#include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -19,7 +23,34 @@ namespace Shader::IR {
 void DumpProgram(const Program& program, const Info& info, const std::string& type) {
     using namespace Common::FS;
 
-    if (!EmulatorSettings.IsDumpShaders()) {
+    static const struct TargetedDumpHash {
+        const char* raw{Common::DiagnosticEnv<"SHADPS4_DIAG_DUMP_HASH">()};
+        bool valid{};
+        u64 hash{};
+        TargetedDumpHash() {
+            if (!raw) {
+                return;
+            }
+            errno = 0;
+            char* end = nullptr;
+            const unsigned long long parsed = std::strtoull(raw, &end, 16);
+            if (end == raw || *end != '\0' || *raw == '-' || parsed == 0 || errno == ERANGE) {
+                LOG_WARNING(Render_Recompiler,
+                            "SHADPS4_DIAG_DUMP_HASH malformed value '{}', falling back to the "
+                            "dumpShaders setting",
+                            raw);
+                return;
+            }
+            valid = true;
+            hash = static_cast<u64>(parsed);
+        }
+    } targeted_dump;
+
+    if (targeted_dump.valid) {
+        if (info.pgm_hash != targeted_dump.hash) {
+            return;
+        }
+    } else if (!EmulatorSettings.IsDumpShaders()) {
         return;
     }
 

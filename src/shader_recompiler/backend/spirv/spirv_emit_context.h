@@ -395,8 +395,12 @@ public:
     Id input_attr_array;
     Id output_attr_array;
     std::array<SpirvAttribute, IR::NumParams> input_params{};
+    std::array<std::array<SpirvAttribute, 4>, IR::NumParams> input_param_components{};
+    std::array<bool, IR::NumParams> input_param_is_split{};
     std::array<SpirvAttribute, IR::NumParams> output_params{};
     std::array<SpirvAttribute, IR::NumRenderTargets> frag_outputs{};
+    Id got_sky_tile_uv{};
+    Id got_sky_sample{};
 
     Id uf11_to_f32{};
     Id f32_to_uf11{};
@@ -407,6 +411,7 @@ public:
 
     Id read_const{};
     Id read_const_dynamic{};
+
 
 private:
     void DefineArithmeticTypes();

@@ -63,4 +63,22 @@ Id EmitGroupAny(EmitContext& ctx, Id bit) {
     return ctx.OpGroupNonUniformAny(ctx.U1[1], SubgroupScope(ctx), bit);
 }
 
+Id EmitGroupUMin(EmitContext& ctx, Id value) {
+    // The guest's inactive lanes contribute UINT_MAX to this recognized minimum.
+    // Gather only active Vulkan lanes; never shuffle from an inactive invocation.
+    const Id ballot = ctx.OpGroupNonUniformBallot(ctx.U32[4], SubgroupScope(ctx), ctx.true_value);
+    const Id own_lane = EmitLaneId(ctx);
+    Id minimum = value;
+    for (u32 lane = 0; lane < 64; ++lane) {
+        const Id word = ctx.OpCompositeExtract(ctx.U32[1], ballot, lane / 32);
+        const Id bit = ctx.OpBitwiseAnd(ctx.U32[1], word, ctx.ConstU32(1u << (lane % 32)));
+        const Id active = ctx.OpINotEqual(ctx.U1[1], bit, ctx.u32_zero_value);
+        const Id source = ctx.OpSelect(ctx.U32[1], active, ctx.ConstU32(lane), own_lane);
+        const Id shuffled =
+            ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, source);
+        minimum = ctx.OpUMin(ctx.U32[1], minimum, shuffled);
+    }
+    return minimum;
+}
+
 } // namespace Shader::Backend::SPIRV

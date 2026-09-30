@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include "common/logging/classes.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/frontend/decode.h"
@@ -9,6 +10,7 @@
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/post_order.h"
 #include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/frontend/wave_minimum.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 
@@ -77,6 +79,26 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     while (!slice.atEnd()) {
         program.ins_list.emplace_back(decoder.decodeInstruction(slice));
     }
+    info.has_entry_wave_minimum = false;
+    info.has_unrecognized_lane_reads = false;
+    info.entry_wave_minima.clear();
+    if (info.hw_stage == HwStage::Fragment && profile.subgroup_size == 64) {
+        const auto minima = Gcn::FindEntryWaveMinima(program.ins_list);
+        if (!minima.empty()) {
+            info.has_entry_wave_minimum = true;
+            for (const auto& minimum : minima) {
+                info.entry_wave_minima.push_back({minimum.end_pc, minimum.input_vgpr});
+            }
+            // Other lane reads may belong
+            // to another reduction or descriptor-selection loop; retain diagnostic
+            // loop caps until those operations are independently understood.
+            u32 lane_reads = 0;
+            for (const auto& instruction : program.ins_list) {
+                lane_reads += instruction.opcode == Gcn::Opcode::V_READLANE_B32;
+            }
+            info.has_unrecognized_lane_reads = lane_reads > minima.size() * 2;
+        }
+    }
 
     // Clear any previous pooled data.
     pools.ReleaseContents();
@@ -96,6 +118,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     }
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
+    Shader::Optimization::ReadLaneEliminationPass(program);
     if (info.sw_stage == SwStage::TessellationControl) {
         Shader::Optimization::TessellationPreprocess(program, runtime_info);
         Shader::Optimization::HullShaderTransform(program, runtime_info);
@@ -104,12 +127,17 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
         Shader::Optimization::DomainShaderTransform(program, runtime_info);
     }
     Shader::Optimization::RingAccessElimination(program, runtime_info);
-    Shader::Optimization::ReadLaneEliminationPass(program);
     Shader::IR::DumpProgram(program, info, "pre-res-discover.");
     auto resources = Shader::Optimization::ResourceDiscoverPass(program, profile);
     Shader::Optimization::FlattenExtendedUserdataPass(program);
     Shader::IR::DumpProgram(program, info, "pre-res-patch.");
-    Shader::Optimization::ResourcePatchingPass(program.info, resources, profile);
+    Shader::Optimization::ResourcePatchingPass(program, resources, profile);
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene dynamic image leaving resource patching");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Recompiler, "GoT dynamic image diagnostic leaving resource patching");
+    }
     Shader::Optimization::LowerBufferFormatToRaw(program);
     Shader::Optimization::SharedMemorySimplifyPass(program, profile);
     Shader::Optimization::SharedMemoryToStoragePass(program, runtime_info, profile);
@@ -117,6 +145,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
     Shader::Optimization::LowerHardwareIntrinsics(program);
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene dynamic image leaving IR lowering");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Recompiler, "GoT dynamic image diagnostic leaving IR lowering");
+    }
     Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
 
     // Prepare for structurization by clearing flow graph and lowering phis
@@ -141,6 +175,12 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);
     Shader::Optimization::CollectShaderInfoPass(program, profile);
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene dynamic image leaving IR optimization");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Recompiler, "GoT dynamic image diagnostic leaving IR optimization");
+    }
     Shader::IR::DumpProgram(program, info);
 
     return program;

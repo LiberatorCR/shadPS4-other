@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <unordered_set>
 #include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
@@ -123,8 +124,10 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
         cs_info.workgroup_size[0] * cs_info.workgroup_size[1] * cs_info.workgroup_size[2];
     // The compiler can only omit barriers when the local workgroup size is the same as the HW
     // subgroup.
+    const bool diag_force_barriers = program.info.pgm_hash == 0xdc800181 &&
+                                     Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_FORCE_DC80_LDS_BARRIERS">();
     if (shared_memory_size == 0 || threadgroup_size != GcnSubgroupSize ||
-        !profile.needs_lds_barriers) {
+        (!profile.needs_lds_barriers && !diag_force_barriers)) {
         return;
     }
     using Type = IR::AbstractSyntaxNode::Type;

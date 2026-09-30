@@ -182,6 +182,7 @@ public:
     [[nodiscard]] U32 BallotFindLsb(const U64& mask);
     [[nodiscard]] U1 InverseBallot(const U64& mask);
     [[nodiscard]] U1 GroupAny(const U1& bit);
+    [[nodiscard]] U32 GroupUMin(const U32& value);
 
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2);
     [[nodiscard]] Value CompositeConstruct(const Value& e1, const Value& e2, const Value& e3);
@@ -410,7 +411,10 @@ public:
     void ImageWrite(const Value& handle, const Value& coords, const U32& lod,
                     const U32& multisampling, const Value& color, TextureInstInfo info);
 
-    [[nodiscard]] F32 CubeFaceIndex(const Value& cube_coords);
+    [[nodiscard]] F32 CubeFaceIndex(const Value& x, const Value& y, const Value& z);
+    [[nodiscard]] F32 CubeFaceCoordS(const Value& x, const Value& y, const Value& z);
+    [[nodiscard]] F32 CubeFaceCoordT(const Value& x, const Value& y, const Value& z);
+    [[nodiscard]] F32 CubeFaceMajorAxis(const Value& x, const Value& y, const Value& z);
 
     void EmitVertex();
     void EmitPrimitive();

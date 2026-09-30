@@ -242,7 +242,7 @@ Id EmitFPAdd64(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPSub32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPFma32(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
 Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c);
-Id EmitFPMax32(EmitContext& ctx, Id a, Id b);
+Id EmitFPMax32(EmitContext& ctx, IR::Inst* inst, Id a, Id b);
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b);
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b);
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b);
@@ -435,9 +435,9 @@ Id EmitConvertS32S16(EmitContext& ctx, Id value);
 Id EmitImageHandle(EmitContext& ctx, Id, Id);
 Id EmitImageSampleRaw(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address1, Id address2,
                       Id address3, Id address4);
-Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id bias,
+Id EmitImageSampleImplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id coords, Id bias,
                               const IR::Value& offset);
-Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod,
+Id EmitImageSampleExplicitLod(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id coords, Id lod,
                               const IR::Value& offset);
 Id EmitImageSampleDrefImplicitLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id dref,
                                   Id bias, const IR::Value& offset);
@@ -447,9 +447,9 @@ Id EmitImageGather(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                    const IR::Value& offset);
 Id EmitImageGatherDref(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
                        const IR::Value& offset, Id dref);
-Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, u32 handle, Id lod, bool skip_mips);
+Id EmitImageQueryDimensions(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id lod, bool skip_mips);
 Id EmitImageQueryLod(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords);
-Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id derivatives_dx,
+Id EmitImageGradient(EmitContext& ctx, IR::Inst* inst, const IR::Value& handle, Id coords, Id derivatives_dx,
                      Id derivatives_dy, const IR::Value& offset, const IR::Value& lod_clamp);
 Id EmitImageRead(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms);
 void EmitImageWrite(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id lod, Id ms,
@@ -470,7 +470,10 @@ Id EmitImageAtomicXor32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords,
 Id EmitImageAtomicExchange32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id coords, Id value);
 Id EmitImageAtomicCmpSwap32(EmitContext& ctx, IR::Inst* inst, u32 handle, Id address, Id value,
                             Id cmp_value);
-Id EmitCubeFaceIndex(EmitContext& ctx, IR::Inst* inst, Id cube_coords);
+Id EmitCubeFaceIndex(EmitContext& ctx, IR::Inst* inst, Id x, Id y, Id z);
+Id EmitCubeFaceCoordS(EmitContext& ctx, IR::Inst* inst, Id x, Id y, Id z);
+Id EmitCubeFaceCoordT(EmitContext& ctx, IR::Inst* inst, Id x, Id y, Id z);
+Id EmitCubeFaceMajorAxis(EmitContext& ctx, IR::Inst* inst, Id x, Id y, Id z);
 Id EmitLaneId(EmitContext& ctx);
 Id EmitWarpId(EmitContext& ctx);
 Id EmitQuadBroadcast(EmitContext& ctx, Id value, Id index);
@@ -483,6 +486,7 @@ Id EmitBallot(EmitContext& ctx, Id bit);
 Id EmitBallotFindLsb(EmitContext& ctx, Id mask);
 Id EmitInverseBallot(EmitContext& ctx, Id mask);
 Id EmitGroupAny(EmitContext& ctx, Id bit);
+Id EmitGroupUMin(EmitContext& ctx, Id value);
 Id EmitDataAppend(EmitContext& ctx, Id gds_dw_offset, Id exec);
 Id EmitDataConsume(EmitContext& ctx, Id gds_dw_offset, Id exec);
 

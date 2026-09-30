@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include "common/assert.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
@@ -84,7 +85,14 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineInterfaces();
     DefineSharedMemory();
     DefineBuffers();
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene SPIR-V context before images count={}",
+                 info.images.size());
+    }
     DefineImagesAndSamplers();
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene SPIR-V context after images");
+    }
     DefineFunctions();
 }
 
@@ -277,20 +285,28 @@ void EmitContext::DefineAmdPerVertexAttribs() {
     if (!profile.supports_amd_shader_explicit_vertex_parameter) {
         return;
     }
-    for (s32 i = 0; i < runtime_info.hw.fs.num_inputs; i++) {
-        const auto& input = runtime_info.hw.fs.inputs[i];
-        if (input.IsDefault() || info.fs_interpolation[i].primary != Qualifier::PerVertex) {
+    const auto load_per_vertex = [&](SpirvAttribute& param) {
+        if (!param.is_array) {
+            return;
+        }
+        const Id pointer = param.id;
+        for (u32 vertex = 0; vertex < 3; ++vertex) {
+            param.id_array[vertex] =
+                OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(vertex));
+        }
+        param.is_loaded = true;
+    };
+    for (u32 i = 0; i < runtime_info.hw.fs.num_inputs; ++i) {
+        if (runtime_info.hw.fs.inputs[i].IsDefault()) {
             continue;
         }
-        auto& param = input_params[i];
-        const Id pointer = param.id;
-        param.id_array[0] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(0U));
-        param.id_array[1] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(1U));
-        param.id_array[2] =
-            OpInterpolateAtVertexAMD(F32[param.num_components], pointer, ConstU32(2U));
-        param.is_loaded = true;
+        if (input_param_is_split[i]) {
+            for (auto& component : input_param_components[i]) {
+                load_per_vertex(component);
+            }
+        } else {
+            load_per_vertex(input_params[i]);
+        }
     }
 }
 
@@ -407,9 +423,11 @@ void EmitContext::DefineInputs() {
             if (profile.supports_amd_shader_explicit_vertex_parameter) {
                 bary_coord_smooth_sample = DefineVariable(
                     F32[2], spv::BuiltIn::BaryCoordSmoothSampleAMD, spv::StorageClass::Input);
-            } else if (profile.supports_fragment_shader_barycentric && !ValidId(bary_coord)) {
-                bary_coord =
-                    DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR, spv::StorageClass::Input);
+            } else if (profile.supports_fragment_shader_barycentric) {
+                if (!ValidId(bary_coord)) {
+                    bary_coord = DefineVariable(F32[3], spv::BuiltIn::BaryCoordKHR,
+                                                spv::StorageClass::Input);
+                }
                 // we would need sample_index to interpolate the bary_coord later
                 if (!ValidId(sample_index)) {
                     sample_index =
@@ -448,32 +466,63 @@ void EmitContext::DefineInputs() {
                 continue;
             }
             const IR::Attribute param = IR::Attribute::Param0 + i;
-            const u32 num_components = info.loads.NumComponents(param);
-            const auto [primary, auxiliary] = info.fs_interpolation[i];
-            const Id type = F32[num_components];
-            const Id attr_id = [&] {
-                const auto bind_location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
-                if (primary == Qualifier::PerVertex &&
-                    profile.supports_fragment_shader_barycentric) {
-                    return Name(DefineInput(TypeArray(type, ConstU32(3U)), bind_location),
-                                fmt::format("fs_in_attr{}_p", i));
+            // GCN selects interpolation per component. In particular, an integer payload
+            // read with V_INTERP_MOV must not inherit a neighboring component's P1/P2 mode.
+            std::optional<Info::Interpolation> common;
+            bool split = false;
+            for (u32 component = 0; component < 4; ++component) {
+                if (!info.loads.Get(param, component)) {
+                    continue;
                 }
-                return Name(DefineInput(type, bind_location), fmt::format("fs_in_attr{}", i));
-            }();
-            if (primary == Qualifier::PerVertex) {
-                Decorate(attr_id, profile.supports_amd_shader_explicit_vertex_parameter
-                                      ? spv::Decoration::ExplicitInterpAMD
-                                      : spv::Decoration::PerVertexKHR);
-            } else if (primary != Qualifier::Smooth) {
-                Decorate(attr_id, primary == Qualifier::Flat ? spv::Decoration::Flat
-                                                             : spv::Decoration::NoPerspective);
+                const auto interpolation = info.fs_interpolation[i][component];
+                if (common && *common != interpolation) {
+                    split = true;
+                }
+                common = interpolation;
             }
-            if (auxiliary != Qualifier::None) {
-                Decorate(attr_id, auxiliary == Qualifier::Centroid ? spv::Decoration::Centroid
-                                                                   : spv::Decoration::Sample);
+            if (!common) {
+                continue;
             }
-            input_params[i] = GetAttributeInfo(AmdGpu::NumberFormat::Float, attr_id, num_components,
-                                               false, false, primary == Qualifier::PerVertex);
+            input_param_is_split[i] = split;
+            const auto define_attribute = [&](Info::Interpolation interpolation,
+                                              std::optional<u32> component) {
+                const auto [primary, auxiliary] = interpolation;
+                const u32 num_components = component ? 1 : info.loads.NumComponents(param);
+                const Id type = F32[num_components];
+                const auto location = input.param_index + (has_clip_distance_inputs ? 1 : 0);
+                const bool per_vertex = primary == Qualifier::PerVertex;
+                const Id id = DefineInput(per_vertex && profile.supports_fragment_shader_barycentric
+                                              ? TypeArray(type, ConstU32(3U)) : type, location);
+                Name(id, component ? fmt::format("fs_in_attr{}_c{}", i, *component)
+                                   : fmt::format("fs_in_attr{}", i));
+                if (component) {
+                    Decorate(id, spv::Decoration::Component, *component);
+                }
+                if (per_vertex) {
+                    Decorate(id, profile.supports_amd_shader_explicit_vertex_parameter
+                                     ? spv::Decoration::ExplicitInterpAMD
+                                     : spv::Decoration::PerVertexKHR);
+                } else if (primary != Qualifier::Smooth) {
+                    Decorate(id, primary == Qualifier::Flat ? spv::Decoration::Flat
+                                                           : spv::Decoration::NoPerspective);
+                }
+                if (auxiliary != Qualifier::None) {
+                    Decorate(id, auxiliary == Qualifier::Centroid ? spv::Decoration::Centroid
+                                                                : spv::Decoration::Sample);
+                }
+                return GetAttributeInfo(AmdGpu::NumberFormat::Float, id, num_components,
+                                        false, false, per_vertex);
+            };
+            if (split) {
+                for (u32 component = 0; component < 4; ++component) {
+                    if (info.loads.Get(param, component)) {
+                        input_param_components[i][component] =
+                            define_attribute(info.fs_interpolation[i][component], component);
+                    }
+                }
+            } else {
+                input_params[i] = define_attribute(*common, std::nullopt);
+            }
         }
 
         if (has_clip_distance_inputs) {
@@ -762,18 +811,13 @@ void EmitContext::DefineOutputs() {
 
 void EmitContext::DefinePushDataBlock() {
     // Create push constants block for instance steps rates
-    const Id struct_type{Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[4],
-                                         U32[4], U32[4], U32[4], U32[2]),
-                              "AuxData")};
+    const Id struct_type{
+        Name(TypeStruct(F32[1], F32[1], F32[1], F32[1], U32[4], U32[4], U32[2]), "AuxData")};
     Decorate(struct_type, spv::Decoration::Block);
     MemberName(struct_type, PushData::XOffsetIndex, "xoffset");
     MemberName(struct_type, PushData::YOffsetIndex, "yoffset");
     MemberName(struct_type, PushData::XScaleIndex, "xscale");
     MemberName(struct_type, PushData::YScaleIndex, "yscale");
-    MemberName(struct_type, PushData::UdRegsIndex + 0, "ud_regs0");
-    MemberName(struct_type, PushData::UdRegsIndex + 1, "ud_regs1");
-    MemberName(struct_type, PushData::UdRegsIndex + 2, "ud_regs2");
-    MemberName(struct_type, PushData::UdRegsIndex + 3, "ud_regs3");
     MemberName(struct_type, PushData::BufOffsetIndex + 0, "buf_offsets0");
     MemberName(struct_type, PushData::BufOffsetIndex + 1, "buf_offsets1");
     MemberName(struct_type, PushData::BufOffsetIndex + 2, "buf_offsets2");
@@ -781,13 +825,9 @@ void EmitContext::DefinePushDataBlock() {
     MemberDecorate(struct_type, PushData::YOffsetIndex, spv::Decoration::Offset, 4U);
     MemberDecorate(struct_type, PushData::XScaleIndex, spv::Decoration::Offset, 8U);
     MemberDecorate(struct_type, PushData::YScaleIndex, spv::Decoration::Offset, 12U);
-    MemberDecorate(struct_type, PushData::UdRegsIndex + 0, spv::Decoration::Offset, 16U);
-    MemberDecorate(struct_type, PushData::UdRegsIndex + 1, spv::Decoration::Offset, 32U);
-    MemberDecorate(struct_type, PushData::UdRegsIndex + 2, spv::Decoration::Offset, 48U);
-    MemberDecorate(struct_type, PushData::UdRegsIndex + 3, spv::Decoration::Offset, 64U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 80U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 96U);
-    MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 112U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 0, spv::Decoration::Offset, 16U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 1, spv::Decoration::Offset, 32U);
+    MemberDecorate(struct_type, PushData::BufOffsetIndex + 2, spv::Decoration::Offset, 48U);
     push_data_block = DefineVar(struct_type, spv::StorageClass::PushConstant);
     Name(push_data_block, "push_data");
     interfaces.push_back(push_data_block);
@@ -984,12 +1024,11 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
     const u32 sampled = desc.is_written ? 2 : 1;
     switch (type) {
     case AmdGpu::ImageType::Color1D:
-        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, false, false, sampled, format);
-    case AmdGpu::ImageType::Color1DArray:
-        return ctx.TypeImage(sampled_type, spv::Dim::Dim1D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2D:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, false, sampled, format);
+    case AmdGpu::ImageType::Color1DArray:
     case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Cube:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, true, false, sampled, format);
     case AmdGpu::ImageType::Color2DMsaa:
         return ctx.TypeImage(sampled_type, spv::Dim::Dim2D, false, false, true, sampled, format);
@@ -1002,7 +1041,14 @@ Id ImageType(EmitContext& ctx, const ImageResource& desc, Id sampled_type) {
 }
 
 void EmitContext::DefineImagesAndSamplers() {
+    u32 diag_image_index = 0;
     for (const auto& image_desc : info.images) {
+        if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() && info.pgm_hash == 0x2a3cacd4) {
+            LOG_INFO(Render_Recompiler, "GoT scene SPIR-V image={} dynamic={} count={}",
+                     diag_image_index, image_desc.dynamic_image_array,
+                     image_desc.dynamic_image_count);
+        }
+        ++diag_image_index;
         const auto sharp = image_desc.GetSharp(info);
         const auto nfmt = sharp.GetNumberFmt();
         // Float image atomics fall back to u32 bit-level atomics when native support is
@@ -1019,7 +1065,14 @@ void EmitContext::DefineImagesAndSamplers() {
 
         const u32 num_bindings = image_desc.NumBindings(info);
         Id pointee_type = image_type;
-        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
+        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex ||
+            image_desc.dynamic_image_array) {
+            if (image_desc.dynamic_image_array) {
+                AddExtension("SPV_EXT_descriptor_indexing");
+                AddCapability(spv::Capability::ShaderNonUniform);
+                AddCapability(spv::Capability::SampledImageArrayNonUniformIndexing);
+                AddCapability(spv::Capability::SampledImageArrayDynamicIndexing);
+            }
             pointee_type = TypeArray(pointee_type, ConstU32(num_bindings));
         }
 

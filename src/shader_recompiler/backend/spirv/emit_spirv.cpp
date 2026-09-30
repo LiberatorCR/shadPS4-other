@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include <cstdlib>
 #include <span>
 #include <type_traits>
@@ -154,8 +155,21 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
+    const char* fragment_loop_limit_text = Common::DiagnosticEnv<"SHADPS4_DIAG_FS_LOOP_LIMIT">();
     const bool cap_all_fragment_loops = program.info.hw_stage == HwStage::Fragment &&
-                                        std::getenv("SHADPS4_DIAG_CAP_ALL_FS_LOOPS") != nullptr;
+                                        (Common::DiagnosticEnv<"SHADPS4_DIAG_CAP_ALL_FS_LOOPS">() != nullptr ||
+                                         fragment_loop_limit_text != nullptr ||
+                                         (Common::DiagnosticEnv<"SHADPS4_DIAG_CAP_UNRECOGNIZED_FS_LOOPS">() &&
+                                          (!program.info.has_entry_wave_minimum ||
+                                           program.info.has_unrecognized_lane_reads)));
+    u32 fragment_loop_limit = 32;
+    if (fragment_loop_limit_text != nullptr) {
+        char* end{};
+        const auto parsed = std::strtoul(fragment_loop_limit_text, &end, 10);
+        if (end != fragment_loop_limit_text && *end == '\0' && parsed > 0 && parsed <= 1024) {
+            fragment_loop_limit = static_cast<u32>(parsed);
+        }
+    }
     Id diagnostic_loop_counter{};
     for (const IR::AbstractSyntaxNode& node : program.syntax_list) {
         switch (node.type) {
@@ -211,7 +225,8 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
                 const Id count = ctx.OpLoad(ctx.U32[1], diagnostic_loop_counter);
                 const Id next = ctx.OpIAdd(ctx.U32[1], count, ctx.u32_one_value);
                 ctx.OpStore(diagnostic_loop_counter, next);
-                const Id within_limit = ctx.OpULessThan(ctx.U1[1], next, ctx.ConstU32(32u));
+                const Id within_limit =
+                    ctx.OpULessThan(ctx.U1[1], next, ctx.ConstU32(fragment_loop_limit));
                 cond = ctx.OpLogicalAnd(ctx.U1[1], cond, within_limit);
             }
             const Id loop_header_label{node.data.repeat.loop_header->Definition<Id>()};
@@ -674,12 +689,19 @@ void PatchPhiNodes(const IR::Program& program, EmitContext& ctx) {
 std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_info,
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() &&
+        program.info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene SPIR-V context ready; entering main traversal");
+    }
     const Id main{DefineMain(ctx, program)};
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() &&
+        program.info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene SPIR-V main traversal complete");
+    }
     DefineEntryPoint(program.info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
-    binding.user_data += program.info.ud_mask.NumRegs();
     return ctx.Assemble();
 }
 

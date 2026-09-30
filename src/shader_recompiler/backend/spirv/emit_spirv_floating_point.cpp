@@ -3,6 +3,7 @@
 
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
+#include "shader_recompiler/ir/microinstruction.h"
 
 namespace Shader::Backend::SPIRV {
 
@@ -39,7 +40,7 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
     return Decorate(ctx, inst, ctx.OpFma(ctx.F64[1], a, b, c));
 }
 
-Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
+Id EmitFPMax32(EmitContext& ctx, IR::Inst* inst, Id a, Id b) {
     return ctx.OpFMax(ctx.F32[1], a, b);
 }
 

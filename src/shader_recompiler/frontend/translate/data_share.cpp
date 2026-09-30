@@ -7,6 +7,18 @@
 
 namespace Shader::Gcn {
 
+namespace {
+IR::U32 DataShareAddress(IR::IREmitter& ir, IR::U32 address, bool is_gds) {
+    if (!is_gds) {
+        return address;
+    }
+    // Indexed GDS accesses are relative to the byte base in M0[31:16], just
+    // like append/consume. LDS uses M0 for its size, not an address base.
+    const IR::U32 base = ir.BitFieldExtract(ir.GetM0(), ir.Imm32(16), ir.Imm32(16));
+    return ir.IAdd(base, address);
+}
+} // namespace
+
 void Translator::EmitDataShare(const GcnInst& inst) {
     switch (inst.opcode) {
         // DS
@@ -122,7 +134,7 @@ void Translator::V_WRITELANE_B32(const GcnInst& inst) {
 template <typename T>
 void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{GetSrc(inst.src[0])};
+    const IR::U32 addr = DataShareAddress(ir, GetSrc(inst.src[0]), is_gds);
     const T data = [&] {
         if (op == AtomicOp::Inc || op == AtomicOp::Dec) {
             return T{};
@@ -175,7 +187,7 @@ void Translator::DS_OP(const GcnInst& inst, AtomicOp op, bool rtn) {
 
 void Translator::DS_CMPST(int bit_size, bool rtn, const GcnInst& inst) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{GetSrc(inst.src[0])};
+    const IR::U32 addr = DataShareAddress(ir, GetSrc(inst.src[0]), is_gds);
     const IR::U32 offset =
         ir.Imm32((u32(inst.control.ds.offset1) << 8u) + u32(inst.control.ds.offset0));
     const IR::U32 addr_offset = ir.IAdd(addr, offset);
@@ -201,7 +213,8 @@ void Translator::DS_CMPST(int bit_size, bool rtn, const GcnInst& inst) {
 void Translator::DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool stride64,
                           const GcnInst& inst) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    const IR::U32 addr =
+        DataShareAddress(ir, ir.GetVectorReg(IR::VectorReg(inst.src[0].code)), is_gds);
     const IR::VectorReg data0{inst.src[1].code};
     const IR::VectorReg data1{inst.src[2].code};
     const u32 offset = (inst.control.ds.offset1 << 8u) + inst.control.ds.offset0;
@@ -252,7 +265,8 @@ void Translator::DS_WRITE(int bit_size, bool is_signed, bool is_pair, bool strid
 void Translator::DS_READ(int bit_size, bool is_signed, bool is_pair, bool stride64,
                          const GcnInst& inst) {
     const bool is_gds = inst.control.ds.gds;
-    const IR::U32 addr{ir.GetVectorReg(IR::VectorReg(inst.src[0].code))};
+    const IR::U32 addr =
+        DataShareAddress(ir, ir.GetVectorReg(IR::VectorReg(inst.src[0].code)), is_gds);
     IR::VectorReg dst_reg{inst.dst[0].code};
     const u32 offset = (inst.control.ds.offset1 << 8u) + inst.control.ds.offset0;
     if (info.hw_stage == HwStage::Fragment) {

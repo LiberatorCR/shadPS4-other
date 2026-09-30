@@ -393,7 +393,8 @@ T Translator::GetSrc(const InstOperand& operand) {
         value = get_imm(-4.0f);
         break;
     case OperandField::Inv2Pi:
-        value = get_imm(static_cast<float>(1.0f / (2.0f * std::numbers::pi)));
+        // The ISA specifies half bits 0x3118, already rounded before arithmetic.
+        value = get_imm(0x1.46p-3f);
         break;
     case OperandField::Sdwa:
         UNREACHABLE_MSG("unhandled SDWA");
@@ -929,7 +930,8 @@ pk_type<T> Translator::GetSrcPk(const InstOperand& operand) {
         break;
     }
     case OperandField::Inv2Pi: {
-        value = get_imm(1.0f / (2.0f * std::numbers::pi_v<float>));
+        // Packed half operands use the ISA's exact 0x3118 inline constant.
+        value = get_imm(0x1.46p-3f);
         break;
     }
     case OperandField::VccLo:
@@ -1213,7 +1215,20 @@ void Translator::Translate(IR::Block* block, u32 start_pc, IR::Condition cond,
             continue;
         }
 
-        TranslateInstruction(inst);
+        const Info::WaveMinimum* minimum = nullptr;
+        if (inst.opcode == Opcode::S_MIN_U32) {
+            for (const auto& candidate : info.entry_wave_minima) {
+                if (pc == candidate.pc) {
+                    minimum = &candidate;
+                    break;
+                }
+            }
+        }
+        if (minimum) {
+            SetDst(inst.dst[0], ir.GroupUMin(ir.GetVectorReg(IR::VectorReg{minimum->vgpr})));
+        } else {
+            TranslateInstruction(inst);
+        }
     }
     if (cond != IR::Condition::True && cond != IR::Condition::False) {
         block->branch_cond = ir.ConditionRef(ir.Condition(cond));

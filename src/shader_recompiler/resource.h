@@ -8,6 +8,7 @@
 #include "video_core/amdgpu/resource.h"
 
 #include <boost/container/static_vector.hpp>
+#include <span>
 
 namespace Shader {
 
@@ -114,6 +115,27 @@ enum class MipStorageFallbackMode : u16 {
 
 struct ImageResource {
     SharpFetch<AmdGpu::Image> sharp_fetch{};
+    // A scalar branch edge that dominates every use of this descriptor. Only a
+    // uniform, flattened ReadConst comparison is eligible for host evaluation.
+    struct UseGuard {
+        SharpLocation offset = UNKNOWN_LOCATION;
+        u32 limit{};
+        bool less_than{};
+        bool operator==(const UseGuard&) const = default;
+
+        bool Active(std::span<const u32> flatbuf) const noexcept {
+            return offset == UNKNOWN_LOCATION || offset >= flatbuf.size() ||
+                   ((flatbuf[offset] < limit) == less_than);
+        }
+    } use_guard{};
+    // Diagnostic path for an image descriptor selected from a guest material table.
+    bool dynamic_image_array{};
+    bool dynamic_table_is_srt{};
+    u8 dynamic_image_count{};
+    u8 dynamic_table_ud_reg{};
+    u16 dynamic_table_dw_offset{};
+    u16 dynamic_image_byte_offset{};
+    u16 dynamic_image_stride{};
     bool is_depth{};
     bool is_atomic{};
     bool is_atomic_u32{};
@@ -124,9 +146,30 @@ struct ImageResource {
     MipStorageFallbackMode mip_fallback_mode{};
     SharpFetchPostOp post_op{};
 
-    constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {
+    AmdGpu::Image GetSharpAt(const auto& info, u32 index) const noexcept {
         AmdGpu::Image image{};
-        if (!Fetch(info.flattened_ud_buf.data(), &image)) {
+        if (!use_guard.Active(info.flattened_ud_buf)) {
+            return AmdGpu::Image::Null(is_depth);
+        }
+        if (dynamic_image_array) {
+            if (dynamic_table_is_srt) {
+                if (index >= dynamic_image_count) {
+                    return AmdGpu::Image::Null(is_depth);
+                }
+                image = info.template ReadUdReg<AmdGpu::Image>(
+                    dynamic_table_ud_reg,
+                    (dynamic_image_byte_offset + index * dynamic_image_stride) / sizeof(u32));
+            } else {
+                const auto table = info.template ReadUdReg<AmdGpu::Buffer>(
+                    dynamic_table_ud_reg, dynamic_table_dw_offset);
+                if (index >= dynamic_image_count || index >= table.num_records) {
+                    return AmdGpu::Image::Null(is_depth);
+                }
+                const u64 address = table.base_address + u64(index) * dynamic_image_stride +
+                                    dynamic_image_byte_offset;
+                std::memcpy(&image, reinterpret_cast<const void*>(address), sizeof(image));
+            }
+        } else if (!Fetch(info.flattened_ud_buf.data(), &image)) {
             return AmdGpu::Image::Null(is_depth);
         }
         if (post_op == SharpFetchPostOp::ConvertCubeTo2DArray) {
@@ -145,6 +188,11 @@ struct ImageResource {
         return image;
     }
 
+    AmdGpu::Image GetSharp(const auto& info) const noexcept {
+        return dynamic_image_array && !dynamic_table_is_srt ? AmdGpu::Image::Null(is_depth)
+                                                             : GetSharpAt(info, 0);
+    }
+
     constexpr bool Fetch(const u32* flatbuf, AmdGpu::Image* out) const {
         if (!is_r128) {
             // Fetch full 8 byte T#
@@ -159,6 +207,9 @@ struct ImageResource {
     }
 
     u32 NumBindings(const auto& info) const {
+        if (dynamic_image_array) {
+            return dynamic_image_count;
+        }
         const AmdGpu::Image tsharp = GetSharp(info);
         return (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex)
                    ? (tsharp.last_level - tsharp.base_level + 1)
@@ -212,14 +263,12 @@ struct PushData {
     static constexpr u32 YOffsetIndex = 1;
     static constexpr u32 XScaleIndex = 2;
     static constexpr u32 YScaleIndex = 3;
-    static constexpr u32 UdRegsIndex = 4;
-    static constexpr u32 BufOffsetIndex = UdRegsIndex + NUM_USER_DATA_REGS / 4;
+    static constexpr u32 BufOffsetIndex = 4;
 
     float xoffset;
     float yoffset;
     float xscale;
     float yscale;
-    std::array<u32, NUM_USER_DATA_REGS> ud_regs;
     std::array<u8, NUM_BUFFERS> buf_offsets;
 
     void AddOffset(u32 binding, u32 offset) {

@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
+#include <cstdlib>
 #include <limits>
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -11,6 +13,7 @@
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
+#include "shader_recompiler/ir/resource_use_guard.h"
 #include "shader_recompiler/ir/reinterpret.h"
 #include "shader_recompiler/profile.h"
 #include "video_core/amdgpu/resource.h"
@@ -115,11 +118,19 @@ public:
     u32 Add(const ImageResource& desc) {
         const u32 index{Add(image_resources, desc, [&desc](const auto& existing) {
             return desc.sharp_fetch == existing.sharp_fetch && desc.is_array == existing.is_array &&
+                   desc.dynamic_image_array == existing.dynamic_image_array &&
+                   desc.dynamic_table_is_srt == existing.dynamic_table_is_srt &&
+                   desc.dynamic_image_byte_offset == existing.dynamic_image_byte_offset &&
                    desc.mip_fallback_mode == existing.mip_fallback_mode &&
                    desc.constant_mip_index == existing.constant_mip_index &&
                    desc.post_op == existing.post_op;
         })};
         auto& image = image_resources[index];
+        // A shared binding may be used on another path. In that case retain it
+        // unconditionally rather than discard an active use.
+        if (image.use_guard != desc.use_guard) {
+            image.use_guard = {};
+        }
         image.is_atomic |= desc.is_atomic;
         image.is_atomic_u32 |= desc.is_atomic_u32;
         image.is_written |= desc.is_written;
@@ -275,7 +286,7 @@ IR::U32 CalculateDynamicBufferAddress(IR::IREmitter& ir, const IR::Inst& inst,
 }
 
 void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors& descriptors,
-                     const Profile& profile) {
+                     const Profile& profile, const IR::BlockList& blocks) {
     IR::Inst& inst = *resource.user;
 
     // Read image sharp.
@@ -288,6 +299,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         inst_info.has_lod && is_written && !profile.supports_image_load_store_lod;
     ImageResource image_res = {
         .sharp_fetch = ConstructSharpFetch<AmdGpu::Image>(resource.sharps[0]),
+        .use_guard = FindImageUseGuard(blocks, inst.GetParent()),
         .is_depth = bool(inst_info.is_depth),
         .is_atomic = is_atomic,
         .is_array = bool(inst_info.is_array),
@@ -305,7 +317,17 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         }
     }
 
+    static u32 scene_patch_sequence{};
+    const bool trace_scene_patch = info.pgm_hash == 0x2a3cacd4 &&
+                                   Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">();
+    const u32 scene_patch_index = trace_scene_patch ? ++scene_patch_sequence : 0;
+    if (trace_scene_patch) {
+        LOG_INFO(Render_Recompiler, "GoT scene patch {} before GetSharp", scene_patch_index);
+    }
     auto image = image_res.GetSharp(info);
+    if (trace_scene_patch) {
+        LOG_INFO(Render_Recompiler, "GoT scene patch {} after GetSharp", scene_patch_index);
+    }
     ASSERT(image.GetType() != AmdGpu::ImageType::Invalid);
     image_res.is_atomic_u32 =
         is_atomic && image.GetDataFmt() == AmdGpu::DataFormat::Format32 &&
@@ -327,6 +349,7 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
             case AmdGpu::ImageType::Color2D:      // x, y, [lod]
                 return body->Arg(2);
             case AmdGpu::ImageType::Color2DArray: // x, y, slice, [lod]
+            case AmdGpu::ImageType::Cube:         // x, y, face, [lod]
             case AmdGpu::ImageType::Color3D:      // x, y, z, [lod]
                 return body->Arg(3);
             case AmdGpu::ImageType::Color2DMsaa:
@@ -388,20 +411,231 @@ void PatchImageSharp(const ResourceDiscovery& resource, Info& info, Descriptors&
         }
     }
 
+    IR::Value dynamic_index{};
+    if (((Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() &&
+          (info.pgm_hash == 0xff484786 || info.pgm_hash == 0x36593e11)) ||
+         (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() &&
+          info.pgm_hash == 0x2a3cacd4) ||
+         (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SECONDARY_IMAGE">() &&
+          info.pgm_hash == 0x2a3cacd4)) &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+        // This menu shader reads eight T# values from material[index * 340 + offset].
+        // Preserve both the descriptor offset and the GPU-computed material index.
+        const auto* read = resource.sharps[0].dwords[0].TryInst();
+        if (read && read->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+            const auto* shift = read->Arg(1).TryInst();
+            if (shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32 &&
+                shift->Arg(1).IsImmediate() && shift->Arg(1).U32() == 2) {
+                const auto* multiply = shift->Arg(0).TryInst();
+                u32 byte_offset = 0;
+                if (multiply && multiply->GetOpcode() == IR::Opcode::IAdd32 &&
+                    multiply->Arg(1).IsImmediate()) {
+                    byte_offset = multiply->Arg(1).U32();
+                    multiply = multiply->Arg(0).TryInst();
+                }
+                if (multiply && multiply->GetOpcode() == IR::Opcode::IMul32 &&
+                    multiply->Arg(1).IsImmediate() && multiply->Arg(1).U32() == 340 &&
+                    byte_offset <= 224 && byte_offset % 32 == 0) {
+                    dynamic_index = multiply->Arg(0);
+                    image_res.dynamic_image_array = true;
+                    image_res.dynamic_image_count = 24;
+                    image_res.dynamic_table_ud_reg = 0;
+                    image_res.dynamic_table_dw_offset = 92;
+                    image_res.dynamic_image_byte_offset = byte_offset;
+                    image_res.dynamic_image_stride = 340;
+                } else if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SECONDARY_IMAGE">() &&
+                           info.pgm_hash == 0x2a3cacd4 && multiply &&
+                           multiply->GetOpcode() == IR::Opcode::IMul32 &&
+                           multiply->Arg(1).IsImmediate() && multiply->Arg(1).U32() == 60 &&
+                           byte_offset == 0) {
+                    dynamic_index = multiply->Arg(0);
+                    image_res.dynamic_image_array = true;
+                    image_res.dynamic_image_count = 49;
+                    image_res.dynamic_table_ud_reg = 0;
+                    image_res.dynamic_table_dw_offset = 141;
+                    image_res.dynamic_image_byte_offset = 0;
+                    image_res.dynamic_image_stride = 60;
+                }
+            }
+        }
+    }
+
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SKY_NOISE_IMAGES">() &&
+        (info.pgm_hash == 0x3c2e229a || info.pgm_hash == 0x11d5a4b7) &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+        const auto* read = resource.sharps[0].dwords[0].TryInst();
+        const auto* shift = read && (read->GetOpcode() == IR::Opcode::ReadConstBuffer ||
+                                     read->GetOpcode() == IR::Opcode::ReadConst)
+                                ? read->Arg(1).TryInst()
+                                : nullptr;
+        const auto* add = shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32 &&
+                                  shift->Arg(1).IsImmediate() && shift->Arg(1).U32() == 2
+                              ? shift->Arg(0).TryInst()
+                              : nullptr;
+        if (add) {
+            const bool has_offset = add->GetOpcode() == IR::Opcode::IAdd32 &&
+                                    add->Arg(1).IsImmediate();
+            const u32 byte_offset = has_offset ? add->Arg(1).U32() : 0;
+            const auto* tile = has_offset ? add->Arg(0).TryInst() : add;
+            if ((byte_offset == 0 || byte_offset == 96) && tile &&
+                tile->GetOpcode() == IR::Opcode::ShiftLeftLogical32 &&
+                tile->Arg(1).IsImmediate() && tile->Arg(1).U32() == 5) {
+                dynamic_index = tile->Arg(0);
+                image_res.dynamic_image_array = true;
+                image_res.dynamic_table_is_srt = true;
+                image_res.dynamic_image_count = 3;
+                image_res.dynamic_table_ud_reg = 0;
+                image_res.dynamic_image_byte_offset = byte_offset;
+                image_res.dynamic_image_stride = 32;
+                LOG_INFO(Render_Recompiler,
+                         "GoT sky noise dynamic image shader={:#x} byte_offset={} count=3",
+                         info.pgm_hash, byte_offset);
+            }
+        }
+    }
+
+    if (info.pgm_hash == 0xb0db526b &&
+        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_B0_DYNAMIC_IMAGES">() &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+        const auto* read = resource.sharps[0].dwords[0].TryInst();
+        const auto* shift = read && read->GetOpcode() == IR::Opcode::ReadConstBuffer
+                                ? read->Arg(1).TryInst() : nullptr;
+        const auto* address = shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32 &&
+                                      shift->Arg(1).IsImmediate() && shift->Arg(1).U32() == 2
+                                  ? shift->Arg(0).TryInst() : nullptr;
+        u32 byte_offset = 0;
+        if (address && address->GetOpcode() == IR::Opcode::IAdd32 &&
+            address->Arg(1).IsImmediate()) {
+            byte_offset = address->Arg(1).U32();
+            address = address->Arg(0).TryInst();
+        }
+        if (address && address->GetOpcode() == IR::Opcode::IMul32 &&
+            address->Arg(1).IsImmediate() && address->Arg(1).U32() == 224 &&
+            byte_offset <= 64 && byte_offset % 32 == 0) {
+            dynamic_index = address->Arg(0);
+            image_res.dynamic_image_array = true;
+            image_res.dynamic_image_count = 49;
+            image_res.dynamic_table_ud_reg = 0;
+            image_res.dynamic_table_dw_offset = 59;
+            image_res.dynamic_image_byte_offset = byte_offset;
+            image_res.dynamic_image_stride = 224;
+            LOG_INFO(Render_Recompiler, "GoT grass image descriptor offset={} count=49", byte_offset);
+        } else if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_B0_TRACE_MISS">()) {
+            LOG_INFO(Render_Recompiler,
+                     "GoT grass matcher miss: read_op={} shift_op={} shift_imm={} addr_op={} "
+                     "addr_imm={} addr0_op={}",
+                     read ? read->GetOpcode() : IR::Opcode::Void,
+                     shift ? shift->GetOpcode() : IR::Opcode::Void,
+                     shift && shift->Arg(1).IsImmediate() ? shift->Arg(1).U32() : 0xffffffffu,
+                     address ? address->GetOpcode() : IR::Opcode::Void,
+                     address && address->Arg(1).IsImmediate() ? address->Arg(1).U32() : 0xffffffffu,
+                     address ? (address->Arg(0).TryInst()
+                                   ? address->Arg(0).Inst()->GetOpcode()
+                                   : IR::Opcode::Void)
+                             : IR::Opcode::Void);
+        }
+    }
+
+    if (info.pgm_hash == 0x2a3cacd4 &&
+        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_PROBE_SCENE_DESCRIPTORS">() &&
+        inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+        const auto* read = resource.sharps[0].dwords[0].TryInst();
+        const auto* shift = read && read->GetOpcode() == IR::Opcode::ReadConstBuffer
+                                ? read->Arg(1).TryInst()
+                                : nullptr;
+        const auto* address = shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32
+                                  ? shift->Arg(0).TryInst()
+                                  : nullptr;
+        u32 byte_offset = 0;
+        if (address && address->GetOpcode() == IR::Opcode::IAdd32 &&
+            address->Arg(1).IsImmediate()) {
+            byte_offset = address->Arg(1).U32();
+            address = address->Arg(0).TryInst();
+        }
+        const bool matches_material_table =
+            address && address->GetOpcode() == IR::Opcode::IMul32 &&
+            address->Arg(1).IsImmediate() && address->Arg(1).U32() == 340 &&
+            byte_offset <= 224 && byte_offset % 32 == 0;
+        const bool runtime_selected = [&] {
+            for (u32 i = 0; i < image_res.sharp_fetch.N; ++i) {
+                if ((image_res.sharp_fetch.load_mask & (1 << i)) &&
+                    image_res.sharp_fetch.offsets[i] == UNKNOWN_LOCATION) {
+                    return true;
+                }
+            }
+            return false;
+        }();
+        LOG_INFO(Render_Recompiler,
+                 "GoT scene sample descriptor: runtime={} material_match={} byte_offset={} "
+                 "first_opcode={} source_opcode={} sample_flags={:#x}",
+                 runtime_selected, matches_material_table, byte_offset,
+                 read ? read->GetOpcode() : IR::Opcode::Void,
+                 address ? address->GetOpcode() : IR::Opcode::Void, inst.Flags<u32>());
+    }
+
+    if (trace_scene_patch) {
+        LOG_INFO(Render_Recompiler, "GoT scene patch {} before Add dynamic={}",
+                 scene_patch_index, image_res.dynamic_image_array);
+    }
     u32 image_binding = descriptors.Add(image_res);
+    if (trace_scene_patch) {
+        LOG_INFO(Render_Recompiler, "GoT scene patch {} after Add binding={}",
+                 scene_patch_index, image_binding);
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() &&
+        info.pgm_hash == 0xff484786 && image_binding >= 2 &&
+        !image_res.dynamic_image_array && inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
+        const auto* first = resource.sharps[0].dwords[0].TryInst();
+        LOG_INFO(Render_Recompiler,
+                 "GoT unmatched image sample binding={} first_opcode={}", image_binding,
+                 first ? first->GetOpcode() : IR::Opcode::Void);
+        if (first && first->GetOpcode() == IR::Opcode::ReadConstBuffer) {
+            const auto* shift = first->Arg(1).TryInst();
+            const auto* add = shift && shift->GetOpcode() == IR::Opcode::ShiftRightLogical32
+                                  ? shift->Arg(0).TryInst()
+                                  : nullptr;
+            LOG_INFO(Render_Recompiler,
+                     "GoT unmatched sample offset shift={} add={} byte_offset={}",
+                     shift ? shift->GetOpcode() : IR::Opcode::Void,
+                     add ? add->GetOpcode() : IR::Opcode::Void,
+                     add && add->GetOpcode() == IR::Opcode::IAdd32 && add->Arg(1).IsImmediate()
+                         ? add->Arg(1).U32()
+                         : 0xffffffffu);
+        }
+    }
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
 
     if (inst.GetOpcode() == IR::Opcode::ImageSampleRaw) {
         auto& lod_prod = resource.sharps[1].post_op_data.lod_prod;
+        const auto sampler_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]);
+        if (info.pgm_hash == 0x2a3cacd4 &&
+            Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_MATERIAL_SAMPLERS">()) {
+            bool runtime_sampler = false;
+            for (u32 i = 0; i < sampler_fetch.N; ++i) {
+                runtime_sampler |= (sampler_fetch.load_mask & (1 << i)) &&
+                                   sampler_fetch.offsets[i] == UNKNOWN_LOCATION;
+            }
+            LOG_INFO(Render_Recompiler,
+                     "GoT material sampler for image={} sample_flags={:#x} runtime={} load_mask={:#x} "
+                     "offsets={}/{}/{}/{}",
+                     image_binding, inst.Flags<u32>(), runtime_sampler, sampler_fetch.load_mask,
+                     sampler_fetch.offsets[0], sampler_fetch.offsets[1],
+                     sampler_fetch.offsets[2], sampler_fetch.offsets[3]);
+        }
         const u32 sampler_binding = descriptors.Add(SamplerResource{
-            .sharp_fetch = ConstructSharpFetch<AmdGpu::Sampler>(resource.sharps[1]),
+            .sharp_fetch = sampler_fetch,
             .post_op = resource.sharps[1].post_op,
             .post_op_tsharp_dw3_off =
                 lod_prod.IsEmpty() ? UNKNOWN_LOCATION : SharpLocationFromSource(lod_prod.Inst()),
             .is_depth = bool(inst_info.is_depth), // true for the _C (compare) opcodes
         });
-        inst.SetArg(0, ir.Imm32(image_binding | sampler_binding << 16));
+        const auto handle = ir.Imm32(image_binding | sampler_binding << 16);
+        if (dynamic_index.IsEmpty()) {
+            inst.SetArg(0, handle);
+        } else {
+            inst.SetArg(0, ir.CompositeConstruct(handle, IR::U32{dynamic_index}));
+        }
     } else {
         inst.SetArg(0, ir.Imm32(image_binding));
     }
@@ -714,24 +948,15 @@ void PatchBufferArgs(IR::Inst& inst, Info& info) {
                 CalculateBufferAddress(ir, inst, info, buffer, buffer.stride));
 }
 
-IR::Value FixCubeCoords(IR::IREmitter& ir, const AmdGpu::Image& image, const IR::Value& x,
-                        const IR::Value& y, const IR::Value& face) {
-    if (!image.IsCube()) {
-        return ir.CompositeConstruct(x, y, face);
-    }
-    // AMD cube math results in coordinates in the range [1.0, 2.0]. We need
-    // to convert this to the range [0.0, 1.0] to get correct results.
-    const auto fixed_x = ir.FPSub(IR::F32{x}, ir.Imm32(1.f));
-    const auto fixed_y = ir.FPSub(IR::F32{y}, ir.Imm32(1.f));
-    const auto fixed_face =
-        ir.FPFma(ir.FPFloor(ir.FPDiv(IR::F32{face}, ir.Imm32(8.f))), ir.Imm32(-2.f), IR::F32{face});
-    return ir.CompositeConstruct(fixed_x, fixed_y, fixed_face);
-}
-
 void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image_res,
                           const AmdGpu::Image& image) {
     const auto handle = inst.Arg(0);
-    const auto& sampler_res = info.samplers[(handle.U32() >> 16) & 0xFFFF];
+    const auto* dynamic_handle = handle.TryInst();
+    const u32 static_handle =
+        dynamic_handle && dynamic_handle->GetOpcode() == IR::Opcode::CompositeConstructU32x2
+            ? dynamic_handle->Arg(0).U32()
+            : handle.U32();
+    const auto& sampler_res = info.samplers[(static_handle >> 16) & 0xFFFF];
     const auto sampler = sampler_res.GetSharp(info);
 
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
@@ -790,6 +1015,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Cube:
             return ir.CompositeConstruct(read(0), read(8));
         case AmdGpu::ImageType::Color3D:
             return ir.CompositeConstruct(read(0), read(8), read(16));
@@ -812,6 +1038,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         case AmdGpu::ImageType::Color2D:
         case AmdGpu::ImageType::Color2DMsaa:
         case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Cube:
             // (du/dx, dv/dx), (du/dy, dv/dy)
             addr_reg = addr_reg + 4;
             return {ir.CompositeConstruct(get_addr_reg(addr_reg - 4), get_addr_reg(addr_reg - 3)),
@@ -868,11 +1095,8 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             addr_reg = addr_reg + 2;
             return ir.CompositeConstruct(get_coord(addr_reg - 2, 0), get_coord(addr_reg - 1, 1));
         case AmdGpu::ImageType::Color2DArray: // x, y, slice
-            addr_reg = addr_reg + 3;
-            // Note we can use FixCubeCoords with fallthrough cases since it checks for image type.
-            return FixCubeCoords(ir, image, get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
-                                 get_addr_reg(addr_reg - 1));
-        case AmdGpu::ImageType::Color3D: // x, y, z
+        case AmdGpu::ImageType::Cube:         // x, y, face
+        case AmdGpu::ImageType::Color3D:      // x, y, z
             addr_reg = addr_reg + 3;
             return ir.CompositeConstruct(get_coord(addr_reg - 3, 0), get_coord(addr_reg - 2, 1),
                                          get_coord(addr_reg - 1, 2));
@@ -928,7 +1152,12 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     }
 
     const auto image_handle = inst.Arg(0);
-    const auto binding_index = image_handle.U32() & 0xFFFF;
+    const auto* dynamic_handle = image_handle.TryInst();
+    const auto binding_index =
+        ((dynamic_handle && dynamic_handle->GetOpcode() == IR::Opcode::CompositeConstructU32x2)
+             ? dynamic_handle->Arg(0).U32()
+             : image_handle.U32()) &
+        0xFFFF;
     const auto& image_res = info.images[binding_index];
     auto image = image_res.GetSharp(info);
 
@@ -972,6 +1201,7 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
         case AmdGpu::ImageType::Color2DArray:     // x, y, slice, [lod]
         case AmdGpu::ImageType::Color2DMsaaArray: // x, y, slice. (sample is passed on different
                                                   // argument)
+        case AmdGpu::ImageType::Cube:             // x, y, face, [lod]
         case AmdGpu::ImageType::Color3D:          // x, y, z, [lod]
             return {ir.CompositeConstruct(body->Arg(0), body->Arg(1), body->Arg(2)), body->Arg(3)};
         default:
@@ -1017,8 +1247,9 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     }
 }
 
-void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resources,
+void ResourcePatchingPass(IR::Program& program, const ResourceDiscoveryList& resources,
                           const Profile& profile) {
+    auto& info = program.info;
     // Iterate over discovered resources and patch them after finding the sharp.
     // Pass 1: Track resource sharps
     Descriptors descriptors{info};
@@ -1027,8 +1258,15 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
         if (IsBufferInstruction(inst)) {
             PatchBufferSharp(usage, info, descriptors, profile);
         } else if (IsImageInstruction(inst)) {
-            PatchImageSharp(usage, info, descriptors, profile);
+            PatchImageSharp(usage, info, descriptors, profile, program.blocks);
         }
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() &&
+        info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene dynamic image completed resource pass 1");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Recompiler, "GoT dynamic image diagnostic completed resource pass 1");
     }
 
     // Pass 2: Patch instruction args
@@ -1041,6 +1279,13 @@ void ResourcePatchingPass(Shader::Info& info, const ResourceDiscoveryList& resou
         } else if (IsDataRingInstruction(inst)) {
             PatchGlobalDataShareAccess(inst, info, descriptors, profile);
         }
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_SCENE_IMAGES">() &&
+        info.pgm_hash == 0x2a3cacd4) {
+        LOG_INFO(Render_Recompiler, "GoT scene dynamic image completed resource pass 2");
+    }
+    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DYNAMIC_IMAGE_ARRAY">() && info.pgm_hash == 0xff484786) {
+        LOG_INFO(Render_Recompiler, "GoT dynamic image diagnostic completed resource pass 2");
     }
 }
 

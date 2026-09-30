@@ -413,6 +413,7 @@ OPCODE(ConvertF32U16,                                       F32,            U16,
 OPCODE(ConvertU16U32,                                       U16,            U32,                                                                            )
 OPCODE(ConvertU32U16,                                       U32,            U16,                                                                            )
 OPCODE(ConvertU64U32,                                       U64,            U32,                                                                            )
+OPCODE(ConvertU32U64,                                       U32,            U64,                                                                            )
 OPCODE(ConvertU8U32,                                        U8,             U32,                                                                            )
 OPCODE(ConvertU32U8,                                        U32,            U8,                                                                             )
 OPCODE(ConvertS32S8,                                        U32,            U8,                                                                             )
@@ -450,7 +451,10 @@ OPCODE(ImageAtomicExchange32,                               U32,            Opaq
 OPCODE(ImageAtomicCmpSwap32,                                U32,            Opaque,         Opaque,         U32,            U32,                            )
 
 // Cube operations - optional, usable if profile.supports_native_cube_calc
-OPCODE(CubeFaceIndex,                                       F32,            F32x3,                                                                          )
+OPCODE(CubeFaceIndex,                                       F32,            F32,            F32,            F32,                                            )
+OPCODE(CubeFaceCoordS,                                      F32,            F32,            F32,            F32,                                            )
+OPCODE(CubeFaceCoordT,                                      F32,            F32,            F32,            F32,                                            )
+OPCODE(CubeFaceMajorAxis,                                   F32,            F32,            F32,            F32,                                            )
 
 // Warp operations
 OPCODE(LaneId,                                              U32,                                                                                            )
@@ -467,6 +471,7 @@ OPCODE(InverseBallot,                                       U1,             U64,
 OPCODE(DataAppend,                                          U32,            U32,            U1                                                              )
 OPCODE(DataConsume,                                         U32,            U32,            U1                                                              )
 OPCODE(GroupAny,                                            U1,             U1,                                                                             )
+OPCODE(GroupUMin,                                           U32,            U32,                                                                            )
 
 // Time operations
 OPCODE(Memtime,                                             U64,                                                                                            )

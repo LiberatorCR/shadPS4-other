@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/diagnostic_env.h"
 #include "common/assert.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -10,6 +11,7 @@
 #include "shader_recompiler/ir/patch.h"
 #include "shader_recompiler/runtime_info.h"
 
+#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 namespace Shader::Backend::SPIRV {
@@ -47,12 +49,7 @@ static std::pair<Id, bool> OutputAttrComponentType(EmitContext& ctx, IR::Attribu
 }
 
 Id EmitGetUserData(EmitContext& ctx, IR::ScalarReg reg) {
-    const u32 index = ctx.binding.user_data + ctx.info.ud_mask.Index(reg);
-    const u32 half = PushData::UdRegsIndex + (index >> 2);
-    const Id ud_ptr{ctx.OpAccessChain(ctx.TypePointer(spv::StorageClass::PushConstant, ctx.U32[1]),
-                                      ctx.push_data_block, ctx.ConstU32(half),
-                                      ctx.ConstU32(index & 3))};
-    const Id ud_reg{ctx.OpLoad(ctx.U32[1], ud_ptr)};
+    const Id ud_reg{ctx.EmitFlatbufferLoad(ctx.ConstU32(static_cast<u32>(reg)))};
     ctx.Name(ud_reg, fmt::format("ud_{}", u32(reg)));
     return ud_reg;
 }
@@ -83,14 +80,23 @@ Id EmitReadConstBuffer(EmitContext& ctx, u32 handle, Id index) {
 Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     if (IR::IsParam(attr)) {
         const u32 param_index{u32(attr) - u32(IR::Attribute::Param0)};
-        const auto& param{ctx.input_params.at(param_index)};
+        const bool split = ctx.input_param_is_split.at(param_index);
+        const auto& param = split ? ctx.input_param_components.at(param_index).at(comp)
+                                  : ctx.input_params.at(param_index);
         const Id value = [&] {
             if (param.is_array) {
-                ASSERT(param.num_components > 1);
                 if (param.is_loaded) {
+                    if (param.num_components == 1) {
+                        return param.id_array[index];
+                    }
                     return ctx.OpCompositeExtract(param.component_type, param.id_array[index],
                                                   comp);
                 } else {
+                    if (param.num_components == 1) {
+                        return ctx.OpLoad(param.component_type,
+                                          ctx.OpAccessChain(param.pointer_type, param.id,
+                                                            ctx.ConstU32(index)));
+                    }
                     return ctx.OpLoad(param.component_type,
                                       ctx.OpAccessChain(param.pointer_type, param.id,
                                                         ctx.ConstU32(index), ctx.ConstU32(comp)));
@@ -288,6 +294,35 @@ void EmitSetAttribute(EmitContext& ctx, IR::Attribute attr, Id value, u32 elemen
     if (IR::IsMrt(attr)) {
         const u32 index{u32(attr) - u32(IR::Attribute::RenderTarget0)};
         const auto& info{ctx.frag_outputs.at(index)};
+        if (ctx.info.pgm_hash == 0xb0db526b && index == 0 && element < 3 &&
+            Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_GRASS_INDEX_OUTPUT">()) {
+            // Replicate byte 0 of the material-id dword on all channels. Valid table
+            // indices (0..48) stay dark while garbage patterns stay bright, giving the
+            // two cases clearly different screen intensities.
+            const Id bits = ctx.OpBitcast(ctx.U32[1], EmitGetAttribute(ctx, IR::Attribute::Param3, 1, 0));
+            const Id byte = ctx.OpBitwiseAnd(ctx.U32[1], bits, ctx.ConstU32(255U));
+            value = ctx.OpFMul(ctx.F32[1], ctx.OpConvertUToF(ctx.F32[1], byte), ctx.ConstF32(1.0f / 255));
+        }
+        if (ctx.info.pgm_hash == 0x167bdbe8 && index == 0 &&
+            Sirit::ValidId(ctx.got_sky_sample) &&
+            Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_SAMPLE_OUTPUT">()) {
+            if (element < 3) {
+                const Id sampled = ctx.OpLoad(ctx.F32[4], ctx.got_sky_sample);
+                value = ctx.OpCompositeExtract(ctx.F32[1], sampled, element);
+            } else {
+                value = ctx.ConstF32(1.0f);
+            }
+        }
+        if (ctx.info.pgm_hash == 0x167bdbe8 && index == 0 &&
+            Sirit::ValidId(ctx.got_sky_tile_uv) &&
+            Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_UV_OUTPUT">()) {
+            if (element < 2) {
+                const Id uv = ctx.OpLoad(ctx.F32[2], ctx.got_sky_tile_uv);
+                value = ctx.OpCompositeExtract(ctx.F32[1], uv, element);
+            } else {
+                value = ctx.ConstF32(element == 3 ? 1.0f : 0.0f);
+            }
+        }
         if (element < 3 && ctx.runtime_info.hw.fs.color_buffers[index].blend_self_scale) {
             // Emulates GCN's factor-scaled min/max blend: min/max(src*src, dst*dst).
             value = ctx.OpFMul(ctx.F32[1], value, value);
