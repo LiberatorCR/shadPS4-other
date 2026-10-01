@@ -13,7 +13,7 @@ verified baseline. It is still an experimental rendering configuration. The late
 review, exact launch records and limitations are in
 `Build/got-ir-audit/review-completion-20260930/RESULTS.md`; individual upstream
 decisions are in that directory's `UPSTREAM_TRIAGE.md`. The complete suite command
-is `scripts\test_checkout.cmd` (456 passing cases in the latest restored build).
+is `scripts\test_checkout.cmd` (449 passing cases after the upstream merge).
 
 Run `./scripts/got_menu_rendering.ps1` from this checkout. For a bounded capture:
 
@@ -29,6 +29,6 @@ The targeted compute barrier removes the large black/white bands in the tested c
 
 `-ExperimentalMaterials` additionally enables the existing material-image array experiments. Their contribution is not established by moving whole-screen images, and they remain off by default. Raising the fragment-loop limit and enabling raw-buffer synchronization or full tiled-image readbacks did not yield a correct menu.
 
-The older `got_menu_occlusion_workaround.ps1` remains available for diagnosis, but bypassing the CPU depth test is no longer necessary with image readbacks enabled.
+The obsolete CPU occlusion bypass and its launcher were removed during cleanup. Image readbacks preserve the sword without guest instruction patches. Old render captures and tracing sources are archived in `Build/got-ir-audit/main-cleanup-20260930/before-cleanup.zip`.
 
 The source also includes narrowly scoped upstream compute FP-mode, stencil-view, sparse-memory-offset, scheduler-order, and scalar carry/borrow corrections. These address independent correctness defects; they are not individually proven causes of the remaining menu artifacts. Run records, before/after source snapshots, regression checks, and screenshots are under `Build/got-ir-audit/leads-20260928/`.

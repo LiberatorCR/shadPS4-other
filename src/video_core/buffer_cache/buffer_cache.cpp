@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/diagnostic_env.h"
 #include <algorithm>
-#include <cstdlib>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
@@ -104,16 +102,6 @@ void BufferCache::InvalidateMemory(VAddr device_addr, u64 size, bool assume_lock
 }
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool assume_locks) {
-    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_FLUSH">() &&
-        device_addr < 0x144fd90000 && device_addr + size > 0x144fd18000) {
-        static u32 reported_weather_reads = 0;
-        if (reported_weather_reads++ < 32) {
-            LOG_INFO(Render_Vulkan,
-                     "GoT weather buffer read request address={:#x} size={} is_write={} "
-                     "assume_locks={}",
-                     device_addr, size, is_write, assume_locks);
-        }
-    }
     const auto flush_request = [this, device_addr, size, is_write] {
         const u32 first_block = device_addr >> block_shift;
         const u32 last_block = (device_addr + size - 1) >> block_shift;
@@ -140,9 +128,6 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 }
 
 void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 size) {
-    const bool trace_weather_download =
-        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SKY_WEATHER_FLUSH">() &&
-        device_addr < 0x144fd90000 && device_addr + size > 0x144fd18000;
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     const VAddr arena_base = arena->cpu_addr;
@@ -164,20 +149,7 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         gpu_modified_ranges.Subtract(address, size);
     });
     if (total_size_bytes == 0) {
-        if (trace_weather_download) {
-            static u32 reported_empty_weather_downloads = 0;
-            if (reported_empty_weather_downloads++ < 8) {
-                LOG_INFO(Render_Vulkan,
-                         "GoT weather buffer download empty window={:#x}+{}", device_addr,
-                         size);
-            }
-        }
         return;
-    }
-    if (trace_weather_download) {
-        LOG_INFO(Render_Vulkan,
-                 "GoT weather buffer download window={:#x}+{} copies={} total_bytes={}",
-                 device_addr, size, copies.size(), total_size_bytes);
     }
     const auto download = staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached);
     for (auto& copy : copies) {
@@ -187,28 +159,10 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     scheduler.Finish();
 
     download.buffer->Invalidate(download.offset, download.size);
-    static u32 reported_weather_copy_contents = 0;
     for (const auto& copy : copies) {
         auto* dst_addr = std::bit_cast<u8*>(arena_base + copy.srcOffset);
-        const auto* src_addr = download.mapped + (copy.dstOffset - download.offset);
-        u64 source_nonzero = 0;
-        if (trace_weather_download && reported_weather_copy_contents < 24) {
-            for (u64 j = 0; j < copy.size; ++j) {
-                source_nonzero += src_addr[j] != 0;
-            }
-        }
-        memory->TryWriteBacking(dst_addr, src_addr, copy.size);
-        if (trace_weather_download && reported_weather_copy_contents < 24) {
-            ++reported_weather_copy_contents;
-            u64 guest_nonzero = 0;
-            for (u64 j = 0; j < copy.size; ++j) {
-                guest_nonzero += dst_addr[j] != 0;
-            }
-            LOG_INFO(Render_Vulkan,
-                     "GoT weather buffer copied address={:#x} size={} gpu_nonzero={} "
-                     "guest_nonzero={}",
-                     arena_base + copy.srcOffset, copy.size, source_nonzero, guest_nonzero);
-        }
+        memory->TryWriteBacking(dst_addr, download.mapped + (copy.dstOffset - download.offset),
+                                copy.size);
     }
     memory_tracker->UnmarkRegionAsGpuModified(device_addr, size, false);
 }
@@ -227,22 +181,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const auto* arena = GetArena(first_block, last_block);
     EnsureResident(arena, first_block, last_block);
     SynchronizeMemory(arena, device_addr, size, is_written, false);
-    const char* weather_mask_text = Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SYNC_WEATHER_SOURCE_MASK">();
-    const u32 weather_mask = weather_mask_text
-                                 ? static_cast<u32>(std::strtoul(weather_mask_text, nullptr, 0))
-                                 : 3u;
-    const bool weather_raw_image_copy =
-        Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SYNC_WEATHER_RAW_IMAGE">() && !is_written &&
-        (((weather_mask & 1u) &&
-          (device_addr == 0x144fd18000 || device_addr == 0x144fd28000)) ||
-         ((weather_mask & 2u) &&
-          (device_addr == 0x144fd60000 || device_addr == 0x144fd70000)));
-    if ((is_texel_buffer || weather_raw_image_copy) && !is_written) {
-        const bool synchronized = SynchronizeMemoryFromImage(arena, device_addr, size);
-        if (weather_raw_image_copy) {
-            LOG_INFO(Render_Vulkan, "GoT weather raw image sync address={:#x} size={} found={}",
-                     device_addr, size, synchronized);
-        }
+    if (is_texel_buffer && !is_written) {
+        SynchronizeMemoryFromImage(arena, device_addr, size);
     }
     if (is_written) {
         gpu_modified_ranges.Add(device_addr, size);
@@ -498,9 +438,6 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     info.AddWait(signal_sema, signal_tick);
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
-    if (submit_result == vk::Result::eErrorDeviceLost) {
-        instance.LogDeviceFault();
-    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();

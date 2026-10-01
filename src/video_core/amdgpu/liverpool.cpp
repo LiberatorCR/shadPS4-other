@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/diagnostic_env.h"
 #include <boost/preprocessor/stringize.hpp>
-#include <cstdlib>
-#include <map>
 
 #include "common/assert.h"
 #include "common/debug.h"
@@ -66,165 +63,6 @@ static std::span<const u32> NextPacket(std::span<const u32> span, size_t offset)
     }
 
     return span.subspan(offset);
-}
-
-struct GotRawDrawCensus {
-    u32 direct{};
-    u32 indirect{};
-    u32 buffers{};
-    u32 malformed{};
-};
-
-// Diagnostic only: count packets before ProcessGraphics can skip or dispatch them.
-// Nested indirect buffers are counted when their own ProcessGraphics task runs.
-static thread_local GotRawDrawCensus got_raw_draw_census;
-
-static void CensusRawDrawPackets(std::span<const u32> dcb) {
-    ++got_raw_draw_census.buffers;
-    while (!dcb.empty()) {
-        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
-        if (header->type == 2) {
-            dcb = dcb.subspan(1);
-            continue;
-        }
-        if (header->type != 3) {
-            ++got_raw_draw_census.malformed;
-            break;
-        }
-        const size_t words = header->type3.NumWords() + 1;
-        if (words > dcb.size()) {
-            ++got_raw_draw_census.malformed;
-            break;
-        }
-        switch (header->type3.opcode) {
-        case PM4ItOpcode::DrawIndex2:
-        case PM4ItOpcode::DrawIndexOffset2:
-        case PM4ItOpcode::DrawIndexAuto:
-            ++got_raw_draw_census.direct;
-            break;
-        case PM4ItOpcode::DrawIndirect:
-        case PM4ItOpcode::DrawIndirectMulti:
-        case PM4ItOpcode::DrawIndexIndirect:
-        case PM4ItOpcode::DrawIndexIndirectMulti:
-        case PM4ItOpcode::DrawIndexIndirectCountMulti:
-            ++got_raw_draw_census.indirect;
-            break;
-        default:
-            break;
-        }
-        dcb = dcb.subspan(words);
-    }
-}
-
-// A submission-time inventory of candidate packets, including conditional regions.
-// It observes current IB contents, not buffers that the GPU may construct later.
-// Unknown shaders/unsupported state packets are reported rather than guessed.
-struct GotSubmittedDrawCensus {
-    std::array<u32, 2> ps_address{};
-    std::map<u64, u32> hashes;
-    u32 draws{};
-    u32 unknown{};
-    u32 conditional{};
-    u32 indirect_buffers{};
-    u32 malformed{};
-    u32 unsupported_state{};
-    size_t word_budget{1 << 20};
-};
-
-static void CensusSubmittedDrawPackets(std::span<const u32> dcb,
-                                      GotSubmittedDrawCensus& census, u32 depth = 0) {
-    auto* memory = Core::Memory::Instance();
-    while (!dcb.empty()) {
-        const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
-        const size_t words = header->type == 2 ? 1 : header->type3.NumWords() + 1;
-        if ((header->type != 2 && header->type != 3) || words > dcb.size() ||
-            words > census.word_budget) {
-            ++census.malformed;
-            return;
-        }
-        census.word_budget -= words;
-        if (header->type == 2) {
-            dcb = dcb.subspan(words);
-            continue;
-        }
-        switch (header->type3.opcode) {
-        case PM4ItOpcode::SetShReg: {
-            if (words < 3) {
-                ++census.malformed;
-                break;
-            }
-            const u32 offset = dcb[1] & 0xffff;
-            for (size_t i = 2; i < words; ++i) {
-                const u32 reg = offset + static_cast<u32>(i - 2);
-                if (reg == 8 || reg == 9) {
-                    census.ps_address[reg - 8] = dcb[i];
-                }
-            }
-            break;
-        }
-        case PM4ItOpcode::CondExec:
-            ++census.conditional;
-            break;
-        case PM4ItOpcode::IndirectBuffer: {
-            if (words != 4 || depth >= 256) {
-                ++census.malformed;
-                break;
-            }
-            const auto* ib = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            const u64 address = reinterpret_cast<u64>(ib->Address<const u32>());
-            const u32 size = ib->ib_size;
-            if (!size || size > census.word_budget ||
-                !memory->IsValidMapping(address, size * sizeof(u32))) {
-                ++census.malformed;
-                break;
-            }
-            ++census.indirect_buffers;
-            CensusSubmittedDrawPackets({ib->Address<const u32>(), size}, census, depth + 1);
-            break;
-        }
-        case PM4ItOpcode::DrawIndex2:
-        case PM4ItOpcode::DrawIndexOffset2:
-        case PM4ItOpcode::DrawIndexAuto:
-        case PM4ItOpcode::DrawIndirect:
-        case PM4ItOpcode::DrawIndirectMulti:
-        case PM4ItOpcode::DrawIndexIndirect:
-        case PM4ItOpcode::DrawIndexIndirectMulti:
-        case PM4ItOpcode::DrawIndexIndirectCountMulti: {
-            ++census.draws;
-            const u64 address =
-                (u64(census.ps_address[0]) | (u64(census.ps_address[1] & 0xff) << 32)) << 8;
-            if (!address || !memory->IsValidMapping(address, 8)) {
-                ++census.unknown;
-                break;
-            }
-            const auto* code = reinterpret_cast<const u32*>(address);
-            if (code[0] != 0xBEEB03FF) {
-                ++census.unknown;
-                break;
-            }
-            const u64 info_address = address + (u64(code[1]) + 1) * 8;
-            if (!memory->IsValidMapping(info_address, sizeof(BinaryInfo))) {
-                ++census.unknown;
-                break;
-            }
-            const auto* info = reinterpret_cast<const BinaryInfo*>(info_address);
-            if (!info->Valid()) {
-                ++census.unknown;
-                break;
-            }
-            ++census.hashes[info->shader_hash];
-            break;
-        }
-        default:
-            // These packets can change SH state without a directly embedded payload.
-            if (header->type3.opcode == PM4ItOpcode::LoadShReg ||
-                static_cast<u32>(header->type3.opcode.Value()) == 0x63) {
-                ++census.unsupported_state;
-            }
-            break;
-        }
-        dcb = dcb.subspan(words);
-    }
 }
 
 Liverpool::Liverpool() : guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
@@ -304,16 +142,6 @@ void Liverpool::Process(std::stop_token stoken) {
         if (submit_done) {
             VideoCore::EndCapture();
             if (rasterizer) {
-                if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_RAW_DRAW_CENSUS">()) {
-                    static u32 census_submit = 0;
-                    LOG_INFO(Render,
-                             "GoT raw draw census submit={} buffers={} direct={} indirect={} "
-                             "malformed={}",
-                             census_submit++, got_raw_draw_census.buffers,
-                             got_raw_draw_census.direct, got_raw_draw_census.indirect,
-                             got_raw_draw_census.malformed);
-                    got_raw_draw_census = {};
-                }
                 rasterizer->OnSubmit();
                 rasterizer->Flush();
             }
@@ -393,10 +221,6 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
 
-    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_RAW_DRAW_CENSUS">()) {
-        CensusRawDrawPackets(dcb);
-    }
-
     cblock.Reset();
 
     // TODO: potentially, ASCs also can depend on CE and in this case the
@@ -431,34 +255,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
-            if (diag_got_pm4_window && Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_PM4_WINDOW">()) {
-                static u32 reported = 0;
-                if (reported < 512) {
-                    LOG_INFO(Render,
-                             "GoT PM4 window packet={} address={:#x} opcode={:#x} "
-                             "words={}",
-                             reported, reinterpret_cast<u64>(header),
-                             static_cast<u32>(opcode), count + 1);
-                    if (opcode == PM4ItOpcode::DmaData) {
-                        const auto* dma = reinterpret_cast<const PM4DmaData*>(header);
-                        LOG_INFO(Render,
-                                 "GoT PM4 DMA packet={} src_sel={} dst_sel={} "
-                                 "src={:#x} dst={:#x} bytes={} data={:#x}",
-                                 reported, static_cast<u32>(dma->src_sel),
-                                 static_cast<u32>(dma->dst_sel),
-                                 dma->SrcAddress<VAddr>(), dma->DstAddress<VAddr>(),
-                                 dma->NumBytes(), dma->data);
-                    }
-                }
-                ++reported;
-                if (opcode == PM4ItOpcode::DrawIndexIndirect ||
-                    opcode == PM4ItOpcode::DrawIndexIndirectMulti ||
-                    opcode == PM4ItOpcode::DrawIndexIndirectCountMulti ||
-                    opcode == PM4ItOpcode::DrawIndirect ||
-                    opcode == PM4ItOpcode::DrawIndirectMulti) {
-                    diag_got_pm4_window = false;
-                }
-            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -849,16 +645,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
-                        if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_OCCLUSION_EVENTS">()) {
-                            static u32 reported = 0;
-                            if (reported++ < 32) {
-                                LOG_INFO(Render,
-                                         "GoT occlusion result event={} address={:#x} pairs={} "
-                                         "synthetic_counter={:#x}",
-                                         reported, reinterpret_cast<u64>(results),
-                                         num_counter_pairs, pixel_counter);
-                            }
-                        }
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
                             *results = pixel_counter | OcclusionCounterValidMask;
                         }
@@ -1050,19 +836,6 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
                 }
                 const auto skip = *cond_exec->Address() == false;
-                if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_COND_EXEC">()) {
-                    static u32 reported = 0;
-                    if (reported < 2048) {
-                        LOG_INFO(Render,
-                                 "GoT CondExec event={} address={:#x} value={} skip={} "
-                                 "exec_dwords={}",
-                                 reported, reinterpret_cast<u64>(cond_exec->Address()),
-                                 *cond_exec->Address(), skip, cond_exec->exec_count.Value());
-                    } else if (reported == 2048) {
-                        LOG_WARNING(Render, "GoT CondExec trace limit reached");
-                    }
-                    ++reported;
-                }
                 if (skip) {
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
@@ -1413,27 +1186,6 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-
-    if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_SUBMITTED_DRAW_CENSUS">()) {
-        static std::mutex census_mutex;
-        static std::array<u32, 2> ps_address{};
-        static u32 submitted_census{};
-        std::scoped_lock lock{census_mutex};
-        GotSubmittedDrawCensus census;
-        census.ps_address = ps_address;
-        CensusSubmittedDrawPackets(dcb, census);
-        ps_address = census.ps_address;
-        const u32 submit = submitted_census++;
-        LOG_INFO(Render,
-                 "GoT submitted candidates buffer={} draws={} unknown={} conditional={} "
-                 "IBs={} malformed={} unsupported_state={}",
-                 submit, census.draws, census.unknown, census.conditional,
-                 census.indirect_buffers, census.malformed, census.unsupported_state);
-        for (const auto& [hash, count] : census.hashes) {
-            LOG_INFO(Render, "GoT submitted shader buffer={} hash={:#x} candidates={}",
-                     submit, hash, count);
-        }
-    }
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);

@@ -158,7 +158,8 @@ void Traverse(EmitContext& ctx, const IR::Program& program) {
     IR::Block* current_block{};
     const char* fragment_loop_limit_text = Common::DiagnosticEnv<"SHADPS4_DIAG_FS_LOOP_LIMIT">();
     const bool cap_all_fragment_loops = program.info.hw_stage == HwStage::Fragment &&
-                                        (Common::DiagnosticEnv<"SHADPS4_DIAG_CAP_ALL_FS_LOOPS">() != nullptr ||
+                                        (Common::DiagnosticEnv<"SHADPS4_DIAG_CAP_ALL_FS_LOOPS">() !=
+                                             nullptr ||
                                          fragment_loop_limit_text != nullptr ||
                                          (Common::DiagnosticEnv<"SHADPS4_DIAG_CAP_UNRECOGNIZED_FS_LOOPS">() &&
                                           (!program.info.has_entry_wave_minimum ||

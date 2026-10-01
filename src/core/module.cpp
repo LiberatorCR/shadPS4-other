@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include "common/diagnostic_env.h"
-#include <cstdlib>
-
 #include <fmt/format.h>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -18,7 +15,6 @@
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
 #include "core/module.h"
-#include "core/signals.h"
 #include "core/tls.h"
 
 namespace Core {
@@ -350,11 +346,6 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             MemoryPatcher::g_eboot_image_size = base_size;
             MemoryPatcher::g_eboot_name = name;
             MemoryPatcher::OnGameLoaded();
-#ifdef _WIN32
-            if (Common::DiagnosticEnv<"SHADPS4_DIAG_GOT_DEP_TRACE">()) {
-                InstallGoTDependencyTrace(base_virtual_addr);
-            }
-#endif
         }
     }
 }
